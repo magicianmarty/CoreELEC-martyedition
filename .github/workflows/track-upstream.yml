@@ -1,0 +1,82 @@
+name: Track CoreELEC
+
+# The fork is only viable if picking up upstream is cheap. This rebases the
+# patch series onto coreelec-22 and fails loudly the moment a patch stops
+# applying, rather than discovering it months later.
+
+on:
+  schedule:
+    - cron: '0 4 * * 1'
+  workflow_dispatch:
+    inputs:
+      build:
+        description: 'Build an image after rebasing'
+        type: boolean
+        default: false
+
+jobs:
+  rebase:
+    runs-on: ubuntu-latest
+    outputs:
+      moved: ${{ steps.check.outputs.moved }}
+      kodi_pin: ${{ steps.check.outputs.kodi_pin }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: marty-22
+
+      - name: Fetch upstream
+        run: |
+          git remote add upstream https://github.com/CoreELEC/CoreELEC.git
+          git fetch upstream coreelec-22
+
+      - id: check
+        name: Has upstream moved, and did the Kodi pin change?
+        run: |
+          base=$(git merge-base HEAD upstream/coreelec-22)
+          head=$(git rev-parse upstream/coreelec-22)
+          [ "$base" = "$head" ] && echo "moved=false" >> $GITHUB_OUTPUT || echo "moved=true" >> $GITHUB_OUTPUT
+          pin=$(git show upstream/coreelec-22:packages/mediacenter/kodi/package.mk | grep '^PKG_VERSION=' | cut -d'"' -f2)
+          echo "kodi_pin=$pin" >> $GITHUB_OUTPUT
+          echo "upstream Kodi pin: $pin"
+
+      - name: Rebase the patch series
+        if: steps.check.outputs.moved == 'true'
+        run: |
+          git config user.name "marty-fork-bot"
+          git config user.email "noreply@localhost"
+          if ! git rebase upstream/coreelec-22; then
+            echo "::error::Patch series no longer applies. Rebase by hand."
+            git rebase --abort
+            exit 1
+          fi
+
+      - name: Confirm our patches still apply to Kodi's source
+        if: steps.check.outputs.moved == 'true'
+        run: |
+          ls packages/mediacenter/kodi/patches/10[1-9][0-9]-*.patch || true
+          echo "Ours are 1016 and above; upstream owns 1001-1015."
+
+      - name: Push
+        if: steps.check.outputs.moved == 'true'
+        run: git push --force-with-lease origin marty-22
+
+  build:
+    needs: rebase
+    if: needs.rebase.outputs.moved == 'true' || inputs.build
+    # A CoreELEC image is hours of work - that is what the self-hosted fleet is for.
+    runs-on: [self-hosted, linux, x64]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: marty-22
+
+      - name: Build the image
+        run: PROJECT=Amlogic DEVICE=AMLGX ARCH=aarch64 make image
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: coreelec-marty-22
+          path: target/*.tar
+          retention-days: 14
