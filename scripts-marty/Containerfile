@@ -1,0 +1,17 @@
+# Build environment for CoreELEC images.
+#
+# Two stages are not needed, but a non-root user is: the build refuses to run
+# as root, and rootless podman maps the host user to root by default. Run with
+# --userns=keep-id so the host user keeps its uid inside and owns the checkout.
+FROM debian:trixie
+
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update -qq && apt-get install -y -qq --no-install-recommends \
+      bc bsdextrautils bzip2 ca-certificates cpio default-jre-headless \
+      device-tree-compiler diffutils file fonts-freefont-ttf g++ gawk gcc \
+      gettext git gperf gzip imagemagick libc6-dev libjson-perl \
+      libncurses-dev libparse-yapp-perl libxml-parser-perl lzop make patch \
+      patchelf perl python3 python3-setuptools rdfind rsync sed texinfo unzip \
+      wget xfonts-utils xsltproc xz-utils zip zstd curl patchutils \
+    && rm -rf /var/lib/apt/lists/*
+WORKDIR /work
