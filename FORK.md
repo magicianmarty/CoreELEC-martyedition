@@ -55,8 +55,12 @@ why a plain rebuild retires the hand-built ABI-6 `game.libretro` wrapper.
 ## Building
 
 ```sh
-PROJECT=Amlogic DEVICE=AMLGX ARCH=aarch64 make image
+PROJECT=Amlogic-ce DEVICE=Amlogic-no ARCH=aarch64 make image
 ```
+
+Those values are not a guess — they are what the running box reports in
+`/etc/os-release` (`DISTRO_PROJECT`, `DISTRO_DEVICE`). Building
+`Amlogic/AMLGX` instead produces an image for different hardware.
 
 Output is a `.tar` under `target/`, installed by dropping it in
 `/storage/.update/` and rebooting. That is CoreELEC's supported update path;

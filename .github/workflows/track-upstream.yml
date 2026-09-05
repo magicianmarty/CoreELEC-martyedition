@@ -73,7 +73,7 @@ jobs:
           ref: marty-22
 
       - name: Build the image
-        run: PROJECT=Amlogic DEVICE=AMLGX ARCH=aarch64 make image
+        run: PROJECT=Amlogic-ce DEVICE=Amlogic-no ARCH=aarch64 make image
 
       - uses: actions/upload-artifact@v4
         with:
