@@ -1,0 +1,541 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: marty <marty@fyai.co.nz>
+Date: Sun, 6 Sep 2026 14:17:02 +1200
+Subject: [PATCH] RetroPlayer: add an FBO-backed render buffer and pool
+
+The sysmem buffers cannot serve a hardware-rendering game client: the client
+needs a framebuffer object to render into, not a CPU buffer to be uploaded.
+CRenderBufferFBO owns a colour texture attached to the pool's framebuffer and
+returns that framebuffer's name from GetCurrentFramebuffer(), which is what
+IRenderBuffer::GetCurrentFramebuffer() is a pure virtual for.
+
+Ported from garbear/xbmc retro-gl-v3 (lrusak), with four fixes:
+
+- m_texId was never initialised, so the destructor called glDeleteTextures on
+  an indeterminate name whenever a buffer was destroyed before Allocate().
+- CreateTexture() called glGenerateMipmap() before glTexImage2D() and left
+  GL_TEXTURE_MIN_FILTER at GL_LINEAR_MIPMAP_LINEAR with no mipmap chain, so
+  the texture was incomplete and sampled black.
+- Nothing attached depth or stencil. A 3D client - which is every client that
+  wants a GL context - would have rendered without a depth test.
+- The pool reported itself compatible with every render setting.
+  CRPRenderManager::GetRendererForSettings() walks the buffer pools and takes
+  the first compatible one, so that would have captured software clients too.
+  It now answers no until Activate().
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+---
+ xbmc/cores/RetroPlayer/buffers/CMakeLists.txt |  16 +-
+ .../RetroPlayer/buffers/RenderBufferFBO.cpp   | 125 ++++++++++++
+ .../RetroPlayer/buffers/RenderBufferFBO.h     |  65 +++++++
+ .../buffers/RenderBufferPoolFBO.cpp           | 178 ++++++++++++++++++
+ .../RetroPlayer/buffers/RenderBufferPoolFBO.h |  78 ++++++++
+ 5 files changed, 458 insertions(+), 4 deletions(-)
+ create mode 100644 xbmc/cores/RetroPlayer/buffers/RenderBufferFBO.cpp
+ create mode 100644 xbmc/cores/RetroPlayer/buffers/RenderBufferFBO.h
+ create mode 100644 xbmc/cores/RetroPlayer/buffers/RenderBufferPoolFBO.cpp
+ create mode 100644 xbmc/cores/RetroPlayer/buffers/RenderBufferPoolFBO.h
+
+diff --git a/xbmc/cores/RetroPlayer/buffers/CMakeLists.txt b/xbmc/cores/RetroPlayer/buffers/CMakeLists.txt
+index b1dc3d7..7ebf271 100644
+--- a/xbmc/cores/RetroPlayer/buffers/CMakeLists.txt
++++ b/xbmc/cores/RetroPlayer/buffers/CMakeLists.txt
+@@ -11,16 +11,24 @@ set(HEADERS BaseRenderBuffer.h
+ )
+ 
+ if(TARGET ${APP_NAME_LC}::OpenGl)
+-  list(APPEND SOURCES RenderBufferOpenGL.cpp
++  list(APPEND SOURCES RenderBufferFBO.cpp
++                      RenderBufferOpenGL.cpp
++                      RenderBufferPoolFBO.cpp
+                       RenderBufferPoolOpenGL.cpp)
+-  list(APPEND HEADERS RenderBufferOpenGL.h
++  list(APPEND HEADERS RenderBufferFBO.h
++                      RenderBufferOpenGL.h
++                      RenderBufferPoolFBO.h
+                       RenderBufferPoolOpenGL.h)
+ endif()
+ 
+ if(TARGET ${APP_NAME_LC}::OpenGLES)
+-  list(APPEND SOURCES RenderBufferOpenGLES.cpp
++  list(APPEND SOURCES RenderBufferFBO.cpp
++                      RenderBufferOpenGLES.cpp
++                      RenderBufferPoolFBO.cpp
+                       RenderBufferPoolOpenGLES.cpp)
+-  list(APPEND HEADERS RenderBufferOpenGLES.h
++  list(APPEND HEADERS RenderBufferFBO.h
++                      RenderBufferOpenGLES.h
++                      RenderBufferPoolFBO.h
+                       RenderBufferPoolOpenGLES.h)
+ endif()
+ 
+diff --git a/xbmc/cores/RetroPlayer/buffers/RenderBufferFBO.cpp b/xbmc/cores/RetroPlayer/buffers/RenderBufferFBO.cpp
+new file mode 100644
+index 0000000..60e920c
+--- /dev/null
++++ b/xbmc/cores/RetroPlayer/buffers/RenderBufferFBO.cpp
+@@ -0,0 +1,125 @@
++/*
++ *  Copyright (C) 2017-2022 Team Kodi
++ *  This file is part of Kodi - https://kodi.tv
++ *
++ *  SPDX-License-Identifier: GPL-2.0-or-later
++ *  See LICENSES/README.md for more information.
++ */
++
++#include "RenderBufferFBO.h"
++
++#include "ServiceBroker.h"
++#include "cores/RetroPlayer/rendering/RenderContext.h"
++#include "cores/RetroPlayer/rendering/RenderVideoSettings.h"
++#include "utils/log.h"
++#include "windowing/WinSystem.h"
++
++using namespace KODI;
++using namespace RETRO;
++
++CRenderBufferFBO::CRenderBufferFBO(CRenderContext& context,
++                                   GLuint fboId,
++                                   bool depth,
++                                   bool stencil)
++  : m_context(context), m_fboId(fboId), m_depth(depth), m_stencil(stencil)
++{
++}
++
++CRenderBufferFBO::~CRenderBufferFBO()
++{
++  if (m_texId != 0)
++    glDeleteTextures(1, &m_texId);
++  if (m_depthId != 0)
++    glDeleteRenderbuffers(1, &m_depthId);
++  if (m_stencilId != 0 && m_stencilId != m_depthId)
++    glDeleteRenderbuffers(1, &m_stencilId);
++}
++
++bool CRenderBufferFBO::Allocate(AVPixelFormat format, unsigned int width, unsigned int height)
++{
++  // Initialize IRenderBuffer
++  m_format = format;
++  m_width = width;
++  m_height = height;
++
++  if (m_width == 0 || m_height == 0)
++  {
++    CLog::Log(LOGERROR, "RetroPlayer[RENDER]: Refusing to allocate a {}x{} framebuffer", m_width,
++              m_height);
++    return false;
++  }
++
++  if (!CreateTexture())
++    return false;
++
++  return CreateDepthStencil();
++}
++
++bool CRenderBufferFBO::CreateTexture()
++{
++  glGenTextures(1, &m_texId);
++  if (m_texId == 0)
++    return false;
++
++  glBindTexture(GL_TEXTURE_2D, m_texId);
++  glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, m_width, m_height, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
++
++  // A colour attachment has no mipmap chain, so asking for a mipmapped filter
++  // leaves the texture incomplete and it samples black
++  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
++  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
++  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
++  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
++
++  glBindTexture(GL_TEXTURE_2D, 0);
++
++  return true;
++}
++
++bool CRenderBufferFBO::CreateDepthStencil()
++{
++  if (!m_depth && !m_stencil)
++    return true;
++
++  // Packed depth-stencil is core in GLES 3.0 and available on 2.0 through
++  // OES_packed_depth_stencil; a depth-only core gets the 16-bit format that
++  // GLES 2.0 always guarantees
++  const GLenum format = m_stencil ? GL_DEPTH24_STENCIL8 : GL_DEPTH_COMPONENT16;
++
++  glGenRenderbuffers(1, &m_depthId);
++  if (m_depthId == 0)
++    return false;
++
++  glBindRenderbuffer(GL_RENDERBUFFER, m_depthId);
++  glRenderbufferStorage(GL_RENDERBUFFER, format, m_width, m_height);
++  glBindRenderbuffer(GL_RENDERBUFFER, 0);
++
++  if (m_stencil)
++    m_stencilId = m_depthId;
++
++  return true;
++}
++
++uintptr_t CRenderBufferFBO::GetCurrentFramebuffer()
++{
++  glBindFramebuffer(GL_FRAMEBUFFER, m_fboId);
++
++  glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, m_texId, 0);
++
++  // Attached separately rather than through GL_DEPTH_STENCIL_ATTACHMENT so the
++  // same code works on a GLES 2.0 context
++  glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, m_depthId);
++  glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_STENCIL_ATTACHMENT, GL_RENDERBUFFER, m_stencilId);
++
++  const GLenum status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
++  if (status != GL_FRAMEBUFFER_COMPLETE)
++  {
++    CLog::Log(LOGERROR, "RetroPlayer[RENDER]: Framebuffer incomplete, status {:#x}", status);
++    glBindFramebuffer(GL_FRAMEBUFFER, 0);
++    return 0;
++  }
++
++  glBindFramebuffer(GL_FRAMEBUFFER, 0);
++
++  return m_fboId;
++}
+diff --git a/xbmc/cores/RetroPlayer/buffers/RenderBufferFBO.h b/xbmc/cores/RetroPlayer/buffers/RenderBufferFBO.h
+new file mode 100644
+index 0000000..44ddaf5
+--- /dev/null
++++ b/xbmc/cores/RetroPlayer/buffers/RenderBufferFBO.h
+@@ -0,0 +1,65 @@
++/*
++ *  Copyright (C) 2017-2022 Team Kodi
++ *  This file is part of Kodi - https://kodi.tv
++ *
++ *  SPDX-License-Identifier: GPL-2.0-or-later
++ *  See LICENSES/README.md for more information.
++ */
++
++#pragma once
++
++#include "cores/RetroPlayer/buffers/BaseRenderBuffer.h"
++
++#include <memory>
++
++#include <EGL/egl.h>
++#include <EGL/eglext.h>
++
++#include "system_gl.h"
++
++namespace KODI
++{
++namespace RETRO
++{
++class CRenderContext;
++
++/*!
++ * \brief A render buffer the game client renders into directly
++ *
++ * Unlike the sysmem buffers, nothing is uploaded: the buffer owns a colour
++ * texture attached to the pool's framebuffer object, and the client is handed
++ * that framebuffer's name to bind.
++ */
++class CRenderBufferFBO : public CBaseRenderBuffer
++{
++public:
++  CRenderBufferFBO(CRenderContext& context, GLuint fboId, bool depth, bool stencil);
++  ~CRenderBufferFBO() override;
++
++  // implementation of IRenderBuffer
++  bool Allocate(AVPixelFormat format, unsigned int width, unsigned int height) override;
++  size_t GetFrameSize() const override { return 0; }
++  uint8_t* GetMemory() override { return nullptr; }
++  bool UploadTexture() override { return true; }
++
++  uintptr_t GetCurrentFramebuffer() override;
++
++  GLuint TextureID() const { return m_texId; }
++
++protected:
++  CRenderContext& m_context;
++
++private:
++  bool CreateTexture();
++  bool CreateDepthStencil();
++
++  const GLuint m_fboId{0};
++  const bool m_depth{false};
++  const bool m_stencil{false};
++
++  GLuint m_texId{0};
++  GLuint m_depthId{0};
++  GLuint m_stencilId{0};
++};
++} // namespace RETRO
++} // namespace KODI
+diff --git a/xbmc/cores/RetroPlayer/buffers/RenderBufferPoolFBO.cpp b/xbmc/cores/RetroPlayer/buffers/RenderBufferPoolFBO.cpp
+new file mode 100644
+index 0000000..b14b497
+--- /dev/null
++++ b/xbmc/cores/RetroPlayer/buffers/RenderBufferPoolFBO.cpp
+@@ -0,0 +1,178 @@
++/*
++ *  Copyright (C) 2017-2022 Team Kodi
++ *  This file is part of Kodi - https://kodi.tv
++ *
++ *  SPDX-License-Identifier: GPL-2.0-or-later
++ *  See LICENSES/README.md for more information.
++ */
++
++#include "RenderBufferPoolFBO.h"
++
++#include "RenderBufferFBO.h"
++#include "ServiceBroker.h"
++#include "cores/RetroPlayer/rendering/RenderContext.h"
++#include "utils/log.h"
++#include "windowing/WinSystem.h"
++#include "windowing/linux/WinSystemEGL.h"
++
++using namespace KODI;
++using namespace RETRO;
++
++CRenderBufferPoolFBO::CRenderBufferPoolFBO(CRenderContext& context) : m_context(context)
++{
++}
++
++CRenderBufferPoolFBO::~CRenderBufferPoolFBO()
++{
++  DestroyContext();
++}
++
++bool CRenderBufferPoolFBO::IsCompatible(const CRenderVideoSettings& renderSettings) const
++{
++  return m_active;
++}
++
++void CRenderBufferPoolFBO::Activate(bool depth, bool stencil)
++{
++  m_depth = depth;
++  m_stencil = stencil;
++  m_active = true;
++}
++
++IRenderBuffer* CRenderBufferPoolFBO::CreateRenderBuffer(void* header /* = nullptr */)
++{
++  if (m_eglContext == EGL_NO_CONTEXT)
++  {
++    if (!CreateContext())
++      return nullptr;
++  }
++
++  if (m_fboId == 0)
++  {
++    if (!CreateFramebuffer())
++      return nullptr;
++  }
++
++  return new CRenderBufferFBO(m_context, m_fboId, m_depth, m_stencil);
++}
++
++bool CRenderBufferPoolFBO::CreateContext()
++{
++  auto winSystem =
++      dynamic_cast<KODI::WINDOWING::LINUX::CWinSystemEGL*>(CServiceBroker::GetWinSystem());
++  if (winSystem == nullptr)
++  {
++    CLog::Log(LOGERROR, "RetroPlayer[RENDER]: Window system does not provide an EGL context");
++    return false;
++  }
++
++  m_eglDisplay = winSystem->GetEGLDisplay();
++  if (m_eglDisplay == EGL_NO_DISPLAY)
++  {
++    CLog::Log(LOGERROR, "RetroPlayer[RENDER]: Failed to get EGL display");
++    return false;
++  }
++
++  if (!eglInitialize(m_eglDisplay, nullptr, nullptr))
++  {
++    CLog::Log(LOGERROR, "RetroPlayer[RENDER]: Failed to initialize EGL display");
++    return false;
++  }
++
++// clang-format off
++
++//! @todo: improve this
++#if defined (HAS_GLES)
++  eglBindAPI(EGL_OPENGL_ES_API);
++#elif defined (HAS_GL)
++  eglBindAPI(EGL_OPENGL_API);
++#endif
++
++  EGLint attribs[] =
++  {
++#if defined (HAS_GLES)
++    EGL_RENDERABLE_TYPE, EGL_OPENGL_ES2_BIT,
++#elif defined (HAS_GL)
++    EGL_RENDERABLE_TYPE, EGL_OPENGL_BIT,
++#endif
++    EGL_SURFACE_TYPE, EGL_WINDOW_BIT,
++    EGL_RED_SIZE,   8,
++    EGL_GREEN_SIZE, 8,
++    EGL_BLUE_SIZE,  8,
++    EGL_ALPHA_SIZE, 8,
++    EGL_DEPTH_SIZE, 16,
++    EGL_NONE
++  };
++
++  EGLint neglconfigs;
++  if (!eglChooseConfig(m_eglDisplay, attribs, &m_eglConfig, 1, &neglconfigs))
++  {
++    CLog::Log(LOGERROR, "RetroPlayer[RENDER]: Failed to query number of EGL configs");
++    return false;
++  }
++
++  if (neglconfigs <= 0)
++  {
++    CLog::Log(LOGERROR, "RetroPlayer[RENDER]: No suitable EGL configs found");
++    return false;
++  }
++
++#if defined (HAS_GLES)
++  const EGLint context_attribs[] = {
++    EGL_CONTEXT_CLIENT_VERSION, 2,
++    EGL_NONE
++  };
++#elif defined (HAS_GL)
++  const EGLint context_attribs[] = {
++    EGL_CONTEXT_MAJOR_VERSION_KHR, 3,
++    EGL_CONTEXT_MINOR_VERSION_KHR, 2,
++    EGL_CONTEXT_OPENGL_PROFILE_MASK_KHR, EGL_CONTEXT_OPENGL_CORE_PROFILE_BIT_KHR,
++    EGL_NONE
++  };
++#endif
++
++  // clang-format on
++
++  // Shares object names with the window system's context so the render thread
++  // can sample a texture the game loop thread rendered into
++  m_eglContext =
++      eglCreateContext(m_eglDisplay, m_eglConfig, winSystem->GetEGLContext(), context_attribs);
++  if (m_eglContext == EGL_NO_CONTEXT)
++  {
++    CLog::Log(LOGERROR, "RetroPlayer[RENDER]: Failed to create EGL context");
++    return false;
++  }
++
++  if (!eglMakeCurrent(m_eglDisplay, EGL_NO_SURFACE, EGL_NO_SURFACE, m_eglContext))
++  {
++    CLog::Log(LOGERROR, "RetroPlayer[RENDER]: Failed to make context current");
++    eglDestroyContext(m_eglDisplay, m_eglContext);
++    m_eglContext = EGL_NO_CONTEXT;
++    return false;
++  }
++
++  return true;
++}
++
++bool CRenderBufferPoolFBO::CreateFramebuffer()
++{
++  glGenFramebuffers(1, &m_fboId);
++
++  return m_fboId != 0;
++}
++
++void CRenderBufferPoolFBO::DestroyContext()
++{
++  if (m_eglContext == EGL_NO_CONTEXT)
++    return;
++
++  if (m_fboId != 0)
++  {
++    glDeleteFramebuffers(1, &m_fboId);
++    m_fboId = 0;
++  }
++
++  eglMakeCurrent(m_eglDisplay, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
++  eglDestroyContext(m_eglDisplay, m_eglContext);
++  m_eglContext = EGL_NO_CONTEXT;
++}
+diff --git a/xbmc/cores/RetroPlayer/buffers/RenderBufferPoolFBO.h b/xbmc/cores/RetroPlayer/buffers/RenderBufferPoolFBO.h
+new file mode 100644
+index 0000000..9a830d6
+--- /dev/null
++++ b/xbmc/cores/RetroPlayer/buffers/RenderBufferPoolFBO.h
+@@ -0,0 +1,78 @@
++/*
++ *  Copyright (C) 2017-2022 Team Kodi
++ *  This file is part of Kodi - https://kodi.tv
++ *
++ *  SPDX-License-Identifier: GPL-2.0-or-later
++ *  See LICENSES/README.md for more information.
++ */
++
++#pragma once
++
++#include "cores/RetroPlayer/buffers/BaseRenderBufferPool.h"
++
++#include <EGL/egl.h>
++#include <EGL/eglext.h>
++
++#include "system_gl.h"
++
++namespace KODI
++{
++namespace RETRO
++{
++class CRenderContext;
++
++/*!
++ * \brief Pool of framebuffer-backed buffers for hardware-rendering game clients
++ *
++ * The pool owns a GL context shared with the window system's, made current on
++ * the game loop thread, plus the framebuffer object its buffers attach their
++ * colour texture to.
++ *
++ * The pool reports itself incompatible with every render setting until
++ * Activate() is called. CRPRenderManager picks a renderer by walking the buffer
++ * pools and taking the first compatible one, so a pool that answered yes
++ * unconditionally would capture software-rendered clients as well.
++ */
++class CRenderBufferPoolFBO : public CBaseRenderBufferPool
++{
++public:
++  explicit CRenderBufferPoolFBO(CRenderContext& context);
++  ~CRenderBufferPoolFBO() override;
++
++  // implementation of IRenderBufferPool
++  bool IsCompatible(const CRenderVideoSettings& renderSettings) const override;
++  void DestroyContext() override;
++
++  // implementation of CBaseRenderBufferPool
++  IRenderBuffer* CreateRenderBuffer(void* header = nullptr) override;
++
++  /*!
++   * \brief Take over rendering for a client that asked for a GL context
++   *
++   * \param depth The client needs a depth attachment
++   * \param stencil The client needs a stencil attachment
++   */
++  void Activate(bool depth, bool stencil);
++
++protected:
++  bool CreateContext();
++
++  // Construction parameters
++  CRenderContext& m_context;
++
++  // Configuration parameters
++  EGLDisplay m_eglDisplay{EGL_NO_DISPLAY};
++  EGLConfig m_eglConfig{nullptr};
++  EGLContext m_eglContext{EGL_NO_CONTEXT};
++
++private:
++  bool CreateFramebuffer();
++
++  GLuint m_fboId{0};
++
++  bool m_active{false};
++  bool m_depth{false};
++  bool m_stencil{false};
++};
++} // namespace RETRO
++} // namespace KODI

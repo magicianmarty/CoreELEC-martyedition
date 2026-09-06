@@ -1,0 +1,39 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: marty <marty@fyai.co.nz>
+Date: Sun, 6 Sep 2026 14:17:02 +1200
+Subject: [PATCH] RetroPlayer: register the FBO renderer on GBM
+
+The upstream branch only registered CRendererFactoryFBO for Wayland, and
+registered it ahead of the software renderers - which is why that branch also
+had to disable the DMA renderer to stop the FBO pool capturing everything.
+Registering it last, combined with the pool answering IsCompatible() honestly,
+means an unactivated FBO pool cannot affect any software client.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+---
+ xbmc/windowing/gbm/WinSystemGbmGLESContext.cpp | 5 +++++
+ 1 file changed, 5 insertions(+)
+
+diff --git a/xbmc/windowing/gbm/WinSystemGbmGLESContext.cpp b/xbmc/windowing/gbm/WinSystemGbmGLESContext.cpp
+index 74c991b..e48e893 100644
+--- a/xbmc/windowing/gbm/WinSystemGbmGLESContext.cpp
++++ b/xbmc/windowing/gbm/WinSystemGbmGLESContext.cpp
+@@ -11,6 +11,7 @@
+ #include "OptionalsReg.h"
+ #include "cores/RetroPlayer/process/gbm/RPProcessInfoGbm.h"
+ #include "cores/RetroPlayer/rendering/VideoRenderers/RPRendererDMAOpenGLES.h"
++#include "cores/RetroPlayer/rendering/VideoRenderers/RPRendererFBO.h"
+ #include "cores/RetroPlayer/rendering/VideoRenderers/RPRendererOpenGLES.h"
+ #include "cores/VideoPlayer/DVDCodecs/DVDFactoryCodec.h"
+ #include "cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecDRMPRIME.h"
+@@ -66,6 +67,10 @@ bool CWinSystemGbmGLESContext::InitWindowSystem()
+   RETRO::CRPProcessInfoGbm::Register();
+   RETRO::CRPProcessInfoGbm::RegisterRendererFactory(new RETRO::CRendererFactoryDMAOpenGLES);
+   RETRO::CRPProcessInfoGbm::RegisterRendererFactory(new RETRO::CRendererFactoryOpenGLES);
++  // Registered last: CRPRenderManager takes the first buffer pool that reports
++  // itself compatible, and the FBO pool only does so once a game client has
++  // asked for a hardware context
++  RETRO::CRPProcessInfoGbm::RegisterRendererFactory(new RETRO::CRendererFactoryFBO);
+ 
+   // GLES 3.0 required for 10-bit texture format support (GL_RGB10_A2, GL_R16UI, etc.)
+   // Fall back to GLES 2.0 for devices that don't support GLES 3.0 (e.g. lima driver)

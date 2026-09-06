@@ -1,0 +1,28 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: marty <marty@fyai.co.nz>
+Date: Sun, 6 Sep 2026 14:17:02 +1200
+Subject: [PATCH] Games: forward framebuffer dimensions to the render manager
+
+CGameClientStreamHwFramebuffer::GetBuffer() took the client's width and height
+and then asked for a 0x0 buffer. CBaseRenderBufferPool::GetBuffer() allocates
+on a miss, so that is a request to allocate a zero-sized texture.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+---
+ xbmc/games/addons/streams/GameClientStreamHwFramebuffer.cpp | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/xbmc/games/addons/streams/GameClientStreamHwFramebuffer.cpp b/xbmc/games/addons/streams/GameClientStreamHwFramebuffer.cpp
+index 550d5a8..8e593ec 100644
+--- a/xbmc/games/addons/streams/GameClientStreamHwFramebuffer.cpp
++++ b/xbmc/games/addons/streams/GameClientStreamHwFramebuffer.cpp
+@@ -65,7 +65,8 @@ bool CGameClientStreamHwFramebuffer::GetBuffer(unsigned int width,
+   if (m_stream != nullptr)
+   {
+     RETRO::HwFramebufferBuffer hwFramebufferBuffer;
+-    if (m_stream->GetStreamBuffer(0, 0, static_cast<RETRO::StreamBuffer&>(hwFramebufferBuffer)))
++    if (m_stream->GetStreamBuffer(width, height,
++                                  static_cast<RETRO::StreamBuffer&>(hwFramebufferBuffer)))
+     {
+       buffer.hw_framebuffer.framebuffer = hwFramebufferBuffer.framebuffer;
+       return true;
