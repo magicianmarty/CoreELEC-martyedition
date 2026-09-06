@@ -1,0 +1,83 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: marty <marty@fyai.co.nz>
+Date: Sun, 6 Sep 2026 19:59:56 +1200
+Subject: [PATCH] RetroPlayer: find the EGL context on Amlogic too
+
+The pool looked for its shared context by casting the window system to
+CWinSystemEGL. On this hardware that cast always fails: CWinSystemAmlogic
+derives from CWinSystemBase, and CWinSystemAmlogicGLESContext declares the same
+four EGL accessors without inheriting CWinSystemEGL, because it keeps its own
+CEGLContextUtils rather than the base's member. Same names, unrelated types, so
+no single cast finds both.
+
+The symptom was the log line added in the previous commit doing its job:
+"Cannot enable hardware rendering, no GL context", immediately before the client
+segfaulted for want of one.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+---
+ .../buffers/RenderBufferPoolFBO.cpp           | 30 ++++++++++++++++---
+ 1 file changed, 26 insertions(+), 4 deletions(-)
+
+diff --git a/xbmc/cores/RetroPlayer/buffers/RenderBufferPoolFBO.cpp b/xbmc/cores/RetroPlayer/buffers/RenderBufferPoolFBO.cpp
+index 106f85a..6d31794 100644
+--- a/xbmc/cores/RetroPlayer/buffers/RenderBufferPoolFBO.cpp
++++ b/xbmc/cores/RetroPlayer/buffers/RenderBufferPoolFBO.cpp
+@@ -15,6 +15,10 @@
+ #include "windowing/WinSystem.h"
+ #include "windowing/linux/WinSystemEGL.h"
+ 
++#if defined(HAS_LIBAMCODEC)
++#include "windowing/amlogic/WinSystemAmlogicGLESContext.h"
++#endif
++
+ using namespace KODI;
+ using namespace RETRO;
+ 
+@@ -83,15 +87,34 @@ IRenderBuffer* CRenderBufferPoolFBO::CreateRenderBuffer(void* header /* = nullpt
+ 
+ bool CRenderBufferPoolFBO::CreateContext()
+ {
++  // Two shapes of window system expose these. CWinSystemEGL is the shared base
++  // used by GBM and Wayland; CWinSystemAmlogicGLESContext declares the same four
++  // accessors but does not inherit it, because it keeps its own
++  // CEGLContextUtils rather than the base's. Same names, unrelated types, so
++  // there is no single cast that finds both.
++  EGLContext sharedContext = EGL_NO_CONTEXT;
++
+   auto winSystem =
+       dynamic_cast<KODI::WINDOWING::LINUX::CWinSystemEGL*>(CServiceBroker::GetWinSystem());
+-  if (winSystem == nullptr)
++  if (winSystem != nullptr)
++  {
++    m_eglDisplay = winSystem->GetEGLDisplay();
++    sharedContext = winSystem->GetEGLContext();
++  }
++#if defined(HAS_LIBAMCODEC)
++  else if (auto amlWinSystem =
++               dynamic_cast<KODI::WINDOWING::AML::CWinSystemAmlogicGLESContext*>(CServiceBroker::GetWinSystem()))
++  {
++    m_eglDisplay = amlWinSystem->GetEGLDisplay();
++    sharedContext = amlWinSystem->GetEGLContext();
++  }
++#endif
++  else
+   {
+     CLog::Log(LOGERROR, "RetroPlayer[RENDER]: Window system does not provide an EGL context");
+     return false;
+   }
+ 
+-  m_eglDisplay = winSystem->GetEGLDisplay();
+   if (m_eglDisplay == EGL_NO_DISPLAY)
+   {
+     CLog::Log(LOGERROR, "RetroPlayer[RENDER]: Failed to get EGL display");
+@@ -160,8 +183,7 @@ bool CRenderBufferPoolFBO::CreateContext()
+ 
+   // Shares object names with the window system's context so the render thread
+   // can sample a texture the game loop thread rendered into
+-  m_eglContext =
+-      eglCreateContext(m_eglDisplay, m_eglConfig, winSystem->GetEGLContext(), context_attribs);
++  m_eglContext = eglCreateContext(m_eglDisplay, m_eglConfig, sharedContext, context_attribs);
+   if (m_eglContext == EGL_NO_CONTEXT)
+   {
+     CLog::Log(LOGERROR, "RetroPlayer[RENDER]: Failed to create EGL context");
