@@ -1,0 +1,29 @@
+From: marty <marty@fyai.co.nz>
+Subject: [PATCH] Declare requires_opengl, because flycast does
+
+The addon declares requires_opengl=false, which reads as a software core. It is
+not one. core/libretro/libretro.cpp negotiates Vulkan, then GLES3, then GLES2,
+and ends:
+
+    if (!foundRenderApi)
+       return false;    // retro_load_game fails outright
+
+There is no software rasteriser in the libretro build and no HAVE_OPENGL=0
+switch in its Makefile.
+
+The false value is worse than a missing one. requires_opengl=true is what makes
+Kodi hide a game client it cannot drive, which is why mupen64plus-nx sits inert
+rather than failing. Declared false, Kodi offers flycast for every .chd, .gdi
+and .cdi in the library and then fails at load.
+
+--- a/game.libretro.flycast/addon.xml.in
++++ b/game.libretro.flycast/addon.xml.in
+@@ -14,7 +14,7 @@
+ 		<supports_vfs>false</supports_vfs>
+ 		<supports_standalone>true</supports_standalone>
+ 		<supports_disc_control>true</supports_disc_control>
+-		<requires_opengl>false</requires_opengl>
++		<requires_opengl>true</requires_opengl>
+ 	</extension>
+ 	<extension point="xbmc.addon.metadata">
+ 		<license>GPLv2</license>
