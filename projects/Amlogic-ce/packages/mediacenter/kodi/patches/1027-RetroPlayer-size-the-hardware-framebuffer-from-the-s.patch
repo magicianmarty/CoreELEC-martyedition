@@ -1,0 +1,42 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: marty <marty@fyai.co.nz>
+Date: Sun, 6 Sep 2026 20:46:11 +1200
+Subject: [PATCH] RetroPlayer: size the hardware framebuffer from the stream,
+ not from the client
+
+The client never asks for a size - CVideoStream::GetHwFramebuffer() in the
+wrapper calls GetBuffer(0, 0), because a hardware client renders into whatever
+it is handed. That reached CRenderBufferFBO::Allocate() as 0x0, which it
+refuses, so no buffer was created, GetCurrentFramebuffer() returned 0, and the
+client drew to framebuffer 0 - which on our surfaceless context is nowhere at
+all. Black screen, no errors, Kodi rendering happily at 60fps.
+
+Falls back to the dimensions the stream was configured with.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+---
+ xbmc/cores/RetroPlayer/rendering/RPRenderManager.cpp | 11 +++++++++++
+ 1 file changed, 11 insertions(+)
+
+diff --git a/xbmc/cores/RetroPlayer/rendering/RPRenderManager.cpp b/xbmc/cores/RetroPlayer/rendering/RPRenderManager.cpp
+index a492ffd..09d1cb8 100644
+--- a/xbmc/cores/RetroPlayer/rendering/RPRenderManager.cpp
++++ b/xbmc/cores/RetroPlayer/rendering/RPRenderManager.cpp
+@@ -349,6 +349,17 @@ uintptr_t CRPRenderManager::GetCurrentFramebuffer(unsigned int width, unsigned i
+   // waiting for one deadlocks at a black screen with the client emulating
+   // happily into nothing. The software path gets away with the gate because
+   // AddFrame() caches frames until the GUI catches up.
++  // The wrapper asks with 0x0: CVideoStream::GetHwFramebuffer() calls
++  // GetBuffer(0, 0) because a hardware client never states a size - it renders
++  // into whatever it is given. Fall back to what the stream was configured
++  // with, or the pool refuses to allocate and the client silently draws to
++  // framebuffer 0, which on our surfaceless context is nowhere.
++  if (width == 0 || height == 0)
++  {
++    width = m_nominalWidth;
++    height = m_nominalHeight;
++  }
++
+   for (IRenderBufferPool* bufferPool : m_hwBufferPools)
+   {
+     IRenderBuffer* renderBuffer = bufferPool->GetBuffer(width, height);

@@ -1,0 +1,40 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: marty <marty@fyai.co.nz>
+Date: Sun, 6 Sep 2026 21:01:17 +1200
+Subject: [PATCH] RetroPlayer: do not report success with a null hardware
+ framebuffer
+
+GetStreamBuffer() returned true even when GetCurrentFramebuffer() gave back 0.
+The wrapper's CVideoStream::GetHwFramebuffer() allocates its cache before
+calling us and keeps it whatever the answer, so one zero is remembered for the
+life of the stream: every later call short-circuits on the cached value and the
+client renders to framebuffer 0, which on the pool's surfaceless context is
+nowhere. Black screen, no error anywhere, Kodi compositing at 60fps.
+
+Returning false leaves the wrapper's cache unset so the client asks again on the
+next frame, by which time the pool is serving buffers.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+---
+ xbmc/cores/RetroPlayer/streams/RetroPlayerRendering.cpp | 8 +++++++-
+ 1 file changed, 7 insertions(+), 1 deletion(-)
+
+diff --git a/xbmc/cores/RetroPlayer/streams/RetroPlayerRendering.cpp b/xbmc/cores/RetroPlayer/streams/RetroPlayerRendering.cpp
+index dc48bab..ee37272 100644
+--- a/xbmc/cores/RetroPlayer/streams/RetroPlayerRendering.cpp
++++ b/xbmc/cores/RetroPlayer/streams/RetroPlayerRendering.cpp
+@@ -88,7 +88,13 @@ bool CRetroPlayerRendering::GetStreamBuffer(unsigned int width,
+ 
+   hwBuffer.framebuffer = m_renderManager.GetCurrentFramebuffer(width, height);
+ 
+-  return true;
++  // Reporting success with a framebuffer of 0 is worse than failing. The
++  // wrapper's CVideoStream::GetHwFramebuffer() allocates its cache *before*
++  // asking us and keeps it regardless, so a single zero answer is remembered
++  // for the life of the stream and the client draws to framebuffer 0 forever -
++  // which on the pool's surfaceless context is nowhere. Failing instead leaves
++  // the cache empty and the client asks again on the next frame.
++  return hwBuffer.framebuffer != 0;
+ }
+ 
+ void CRetroPlayerRendering::AddStreamData(const StreamPacket& packet)

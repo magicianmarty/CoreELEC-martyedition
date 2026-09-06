@@ -1,0 +1,78 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: marty <marty@fyai.co.nz>
+Date: Sun, 6 Sep 2026 20:38:33 +1200
+Subject: [PATCH] RetroPlayer: ask pools whether they serve hardware, not
+ whether they are compatible
+
+Create() collected its hardware pools by calling IsCompatible() after
+EnableHardwareRendering(). That is the wrong question: IsCompatible() only asks
+whether a pool can satisfy a set of render settings, and
+CRenderBufferPoolOpenGLES::IsCompatible() answers yes for any scaling method it
+supports, hardware client or not.
+
+So two pools ended up serving hardware rendering - "2 buffer pool(s) serving
+hardware rendering" in the log - and the software one, being registered first,
+won the renderer search. Its ConfigureInternal() then rejected AV_PIX_FMT_NONE
+and logged "Failed to configure buffer pool" once per frame against a black
+screen.
+
+IRenderBufferPool gains IsHardwareRendering(), default false, which the FBO pool
+answers with its own activation state.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+---
+ xbmc/cores/RetroPlayer/buffers/IRenderBufferPool.h   | 9 +++++++++
+ xbmc/cores/RetroPlayer/buffers/RenderBufferPoolFBO.h | 1 +
+ xbmc/cores/RetroPlayer/rendering/RPRenderManager.cpp | 7 +++++--
+ 3 files changed, 15 insertions(+), 2 deletions(-)
+
+diff --git a/xbmc/cores/RetroPlayer/buffers/IRenderBufferPool.h b/xbmc/cores/RetroPlayer/buffers/IRenderBufferPool.h
+index e29fb37..de40d8a 100644
+--- a/xbmc/cores/RetroPlayer/buffers/IRenderBufferPool.h
++++ b/xbmc/cores/RetroPlayer/buffers/IRenderBufferPool.h
+@@ -90,6 +90,15 @@ public:
+    * \param stencil The client needs a stencil attachment
+    */
+   virtual void EnableHardwareRendering(bool depth, bool stencil) {}
++
++  /*!
++   * \brief Whether this pool is currently serving a hardware-rendering client
++   *
++   * Distinct from IsCompatible(), which only asks whether the pool can satisfy
++   * a set of render settings. The software pools answer yes to that for any
++   * scaling method they support, hardware client or not.
++   */
++  virtual bool IsHardwareRendering() const { return false; }
+ };
+ } // namespace RETRO
+ } // namespace KODI
+diff --git a/xbmc/cores/RetroPlayer/buffers/RenderBufferPoolFBO.h b/xbmc/cores/RetroPlayer/buffers/RenderBufferPoolFBO.h
+index 5a83a25..9efe76d 100644
+--- a/xbmc/cores/RetroPlayer/buffers/RenderBufferPoolFBO.h
++++ b/xbmc/cores/RetroPlayer/buffers/RenderBufferPoolFBO.h
+@@ -43,6 +43,7 @@ public:
+   bool IsCompatible(const CRenderVideoSettings& renderSettings) const override;
+   void DestroyContext() override;
+   void EnableHardwareRendering(bool depth, bool stencil) override;
++  bool IsHardwareRendering() const override { return m_active; }
+ 
+   // implementation of CBaseRenderBufferPool
+   IRenderBuffer* CreateRenderBuffer(void* header = nullptr) override;
+diff --git a/xbmc/cores/RetroPlayer/rendering/RPRenderManager.cpp b/xbmc/cores/RetroPlayer/rendering/RPRenderManager.cpp
+index 4b03aad..a492ffd 100644
+--- a/xbmc/cores/RetroPlayer/rendering/RPRenderManager.cpp
++++ b/xbmc/cores/RetroPlayer/rendering/RPRenderManager.cpp
+@@ -320,8 +320,11 @@ bool CRPRenderManager::Create(unsigned int width, unsigned int height, bool dept
+   {
+     bufferPool->EnableHardwareRendering(depth, stencil);
+ 
+-    CRenderVideoSettings renderSettings;
+-    if (bufferPool->IsCompatible(renderSettings))
++    // Not IsCompatible(): that only asks whether a pool can satisfy some render
++    // settings, and the software pools say yes for any scaling method they
++    // support. Collecting on it put two pools in here, the software one first,
++    // so it won the renderer search and then rejected AV_PIX_FMT_NONE.
++    if (bufferPool->IsHardwareRendering())
+       m_hwBufferPools.emplace_back(bufferPool);
+   }
+ 

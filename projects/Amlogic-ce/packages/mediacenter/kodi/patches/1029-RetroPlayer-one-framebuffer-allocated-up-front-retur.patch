@@ -1,0 +1,214 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: marty <marty@fyai.co.nz>
+Date: Sun, 6 Sep 2026 21:29:57 +1200
+Subject: [PATCH] RetroPlayer: one framebuffer, allocated up front, returned
+ every frame
+
+Restructures the hardware path to match how RetroArch does it, which is written
+up in HWRENDER.md. It allocates a single FBO during video driver init and its
+get_current_framebuffer is a pure lookup; ours allocated from a pool on first
+request, and every defect chased today was an ordering consequence of that.
+
+Create() now configures the hardware pool itself rather than waiting for the
+first renderer to do it on the rendering thread, allocates exactly one buffer,
+and holds it for the life of the stream. GetCurrentFramebuffer() returns it and
+can no longer allocate, block or fail - which matters because the client calls
+it from the game loop thread during context_reset, where a null answer is a
+segfault inside the client rather than an error we would ever see.
+
+RenderFrame() republishes that one buffer, and DestroyContext() releases it
+before tearing the pool's context down, on the game loop thread that owns the
+GL objects.
+
+Also drops the temporary TRACE instrumentation.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+---
+ .../RetroPlayer/rendering/RPRenderManager.cpp | 104 ++++++++++--------
+ .../RetroPlayer/rendering/RPRenderManager.h   |  11 ++
+ 2 files changed, 70 insertions(+), 45 deletions(-)
+
+diff --git a/xbmc/cores/RetroPlayer/rendering/RPRenderManager.cpp b/xbmc/cores/RetroPlayer/rendering/RPRenderManager.cpp
+index 09d1cb8..b0e9ad0 100644
+--- a/xbmc/cores/RetroPlayer/rendering/RPRenderManager.cpp
++++ b/xbmc/cores/RetroPlayer/rendering/RPRenderManager.cpp
+@@ -308,6 +308,12 @@ void CRPRenderManager::Flush()
+ 
+ void CRPRenderManager::DestroyContext()
+ {
++  // Order matters: the buffer owns GL objects created in the pool's context, so
++  // it has to go first. This runs from EndEvent(), on the game loop thread that
++  // made the context current, which is the only thread allowed to free them.
++  ReleaseHwRenderBuffer();
++  m_hwBufferPools.clear();
++
+   for (IRenderBufferPool* bufferPool : m_processInfo.GetBufferManager().GetBufferPools())
+     bufferPool->DestroyContext();
+ }
+@@ -315,6 +321,7 @@ void CRPRenderManager::DestroyContext()
+ bool CRPRenderManager::Create(unsigned int width, unsigned int height, bool depth, bool stencil)
+ {
+   m_hwBufferPools.clear();
++  ReleaseHwRenderBuffer();
+ 
+   for (IRenderBufferPool* bufferPool : m_processInfo.GetBufferManager().GetBufferPools())
+   {
+@@ -324,55 +331,68 @@ bool CRPRenderManager::Create(unsigned int width, unsigned int height, bool dept
+     // settings, and the software pools say yes for any scaling method they
+     // support. Collecting on it put two pools in here, the software one first,
+     // so it won the renderer search and then rejected AV_PIX_FMT_NONE.
+-    if (bufferPool->IsHardwareRendering())
+-      m_hwBufferPools.emplace_back(bufferPool);
++    if (!bufferPool->IsHardwareRendering())
++      continue;
++
++    // The pool is normally configured by the first renderer built against it,
++    // which happens on the rendering thread long after the client has started
++    // asking for somewhere to draw. Do it here instead. The format is genuinely
++    // unknown - the client renders into a texture we allocate - and the FBO
++    // pool ignores it.
++    if (!bufferPool->IsConfigured() && !bufferPool->Configure(AV_PIX_FMT_NONE))
++    {
++      CLog::Log(LOGERROR, "RetroPlayer[RENDER]: Failed to configure the hardware buffer pool");
++      continue;
++    }
++
++    // One buffer, allocated now, held until the stream closes. This is the
++    // whole point: GetCurrentFramebuffer() becomes a lookup that cannot fail,
++    // instead of an allocation racing the client's first frame.
++    IRenderBuffer* renderBuffer = bufferPool->GetBuffer(width, height);
++    if (renderBuffer == nullptr)
++    {
++      CLog::Log(LOGERROR, "RetroPlayer[RENDER]: Failed to allocate a {}x{} hardware framebuffer",
++                width, height);
++      continue;
++    }
++
++    m_hwRenderBuffer = renderBuffer;
++    m_hwBufferPools.emplace_back(bufferPool);
++    break;
+   }
+ 
+-  if (m_hwBufferPools.empty())
++  if (m_hwRenderBuffer == nullptr)
+   {
+     CLog::Log(LOGERROR, "RetroPlayer[RENDER]: No buffer pool can render a {}x{} hardware frame",
+               width, height);
+     return false;
+   }
+ 
+-  CLog::Log(LOGDEBUG, "RetroPlayer[RENDER]: {} buffer pool(s) serving hardware rendering",
+-            m_hwBufferPools.size());
++  CLog::Log(LOGDEBUG, "RetroPlayer[RENDER]: Hardware framebuffer {} ready at {}x{}",
++            m_hwRenderBuffer->GetCurrentFramebuffer(), width, height);
+ 
+   return true;
+ }
+ 
+ uintptr_t CRPRenderManager::GetCurrentFramebuffer(unsigned int width, unsigned int height)
+ {
+-  // Deliberately not gated on HasVisibleRenderer(), unlike the software path.
+-  // A hardware client needs somewhere to draw *before* it can produce its first
+-  // frame, and a renderer is only created once a frame exists to show - so
+-  // waiting for one deadlocks at a black screen with the client emulating
+-  // happily into nothing. The software path gets away with the gate because
+-  // AddFrame() caches frames until the GUI catches up.
+-  // The wrapper asks with 0x0: CVideoStream::GetHwFramebuffer() calls
+-  // GetBuffer(0, 0) because a hardware client never states a size - it renders
+-  // into whatever it is given. Fall back to what the stream was configured
+-  // with, or the pool refuses to allocate and the client silently draws to
+-  // framebuffer 0, which on our surfaceless context is nowhere.
+-  if (width == 0 || height == 0)
+-  {
+-    width = m_nominalWidth;
+-    height = m_nominalHeight;
+-  }
++  // A lookup, deliberately. The client asks for this during context_reset and
++  // on every frame, from the game loop thread, and anything that can allocate,
++  // block or fail here turns into a black screen or a segfault inside the
++  // client. Create() did the work.
++  if (m_hwRenderBuffer == nullptr)
++    return 0;
++
++  return m_hwRenderBuffer->GetCurrentFramebuffer();
++}
+ 
+-  for (IRenderBufferPool* bufferPool : m_hwBufferPools)
++void CRPRenderManager::ReleaseHwRenderBuffer()
++{
++  if (m_hwRenderBuffer != nullptr)
+   {
+-    IRenderBuffer* renderBuffer = bufferPool->GetBuffer(width, height);
+-    if (renderBuffer != nullptr)
+-    {
+-      // A framebuffer is lent here, not memory, so there is no CPU access open
+-      // on the buffer and nothing for the client to hand back
+-      m_pendingBuffers.emplace_back(PendingBuffer{renderBuffer, nullptr});
+-      return renderBuffer->GetCurrentFramebuffer();
+-    }
++    m_hwRenderBuffer->Release();
++    m_hwRenderBuffer = nullptr;
+   }
+-
+-  return 0;
+ }
+ 
+ void CRPRenderManager::RenderFrame()
+@@ -380,21 +400,15 @@ void CRPRenderManager::RenderFrame()
+   if (m_bFlush || m_state != RENDER_STATE::CONFIGURED)
+     return;
+ 
+-  // The client has finished rendering into the framebuffer it borrowed in
+-  // GetCurrentFramebuffer(). Unlike AddFrame() there is no CPU access to close:
+-  // a framebuffer was lent, not memory.
+-  std::vector<IRenderBuffer*> renderBuffers;
++  if (m_hwRenderBuffer == nullptr)
++    return;
+ 
+-  for (const PendingBuffer& pending : m_pendingBuffers)
+-  {
+-    pending.buffer->Acquire();
+-    renderBuffers.emplace_back(pending.buffer);
+-    pending.buffer->Release();
+-  }
+-  m_pendingBuffers.clear();
++  // The client has finished drawing into the framebuffer it was given. Publish
++  // the same buffer every frame - there is only one, and it is ours. Acquire
++  // balances the Release() the previous frame's entry gets below.
++  m_hwRenderBuffer->Acquire();
+ 
+-  if (renderBuffers.empty())
+-    return;
++  std::vector<IRenderBuffer*> renderBuffers{m_hwRenderBuffer};
+ 
+   {
+     std::unique_lock lock(m_bufferMutex);
+diff --git a/xbmc/cores/RetroPlayer/rendering/RPRenderManager.h b/xbmc/cores/RetroPlayer/rendering/RPRenderManager.h
+index 7bfa830..d7858cf 100644
+--- a/xbmc/cores/RetroPlayer/rendering/RPRenderManager.h
++++ b/xbmc/cores/RetroPlayer/rendering/RPRenderManager.h
+@@ -103,6 +103,7 @@ public:
+                 unsigned int orientationDegCW);
+   void Flush();
+   void DestroyContext();
++  void ReleaseHwRenderBuffer();
+ 
+   // Hardware rendering functions
+   //! @todo These are only examples pulled from the history of the OpenGL
+@@ -270,6 +271,16 @@ private:
+    */
+   std::vector<IRenderBufferPool*> m_hwBufferPools;
+ 
++  /*!
++   * \brief The single framebuffer a hardware client renders into
++   *
++   * Allocated once by Create() and held for the life of the stream, so that
++   * GetCurrentFramebuffer() is a lookup rather than an allocation. RetroArch
++   * does the same and calls it "all on GPU, no need to excessively create
++   * textures" - see HWRENDER.md.
++   */
++  IRenderBuffer* m_hwRenderBuffer{nullptr};
++
+   std::vector<PendingBuffer> m_pendingBuffers; // Only access from game thread
+   std::vector<IRenderBuffer*> m_renderBuffers;
+   std::map<AVPixelFormat, std::map<AVPixelFormat, SwsContext*>> m_scalers; // From -> to -> context

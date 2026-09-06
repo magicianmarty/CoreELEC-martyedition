@@ -1,0 +1,124 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: marty <marty@fyai.co.nz>
+Date: Sun, 6 Sep 2026 20:21:16 +1200
+Subject: [PATCH] RetroPlayer: give the hardware client a buffer before the
+ first frame
+
+N64 negotiated hardware rendering, created its context and emulated at 93% CPU,
+and displayed nothing. GetCurrentFramebuffer() only considered pools with a
+visible renderer, and a renderer is only created once there is a frame to show -
+so the client had nowhere to draw, produced no frame, and no renderer was ever
+made. The software path never hits this because AddFrame() caches frames until
+the GUI catches up; the hardware path has no equivalent.
+
+Create() now records which pools took the job, and:
+
+- GetCurrentFramebuffer() serves them without the visible-renderer gate, so the
+  client can draw its first frame.
+- GetRendererForSettings() searches only them while a hardware client is
+  running. The software pools stay registered and keep reporting themselves
+  compatible - CRenderBufferPoolOpenGLES::IsCompatible() just checks the scaling
+  method - so they would otherwise win the search and render an empty buffer.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+---
+ .../RetroPlayer/rendering/RPRenderManager.cpp | 41 +++++++++++++------
+ .../RetroPlayer/rendering/RPRenderManager.h   |  9 ++++
+ 2 files changed, 37 insertions(+), 13 deletions(-)
+
+diff --git a/xbmc/cores/RetroPlayer/rendering/RPRenderManager.cpp b/xbmc/cores/RetroPlayer/rendering/RPRenderManager.cpp
+index 043bb09..4b03aad 100644
+--- a/xbmc/cores/RetroPlayer/rendering/RPRenderManager.cpp
++++ b/xbmc/cores/RetroPlayer/rendering/RPRenderManager.cpp
+@@ -314,34 +314,40 @@ void CRPRenderManager::DestroyContext()
+ 
+ bool CRPRenderManager::Create(unsigned int width, unsigned int height, bool depth, bool stencil)
+ {
+-  bool bSuccess = false;
++  m_hwBufferPools.clear();
+ 
+-  // No GL work happens here. The pools create their context and framebuffer
+-  // lazily in CreateRenderBuffer(), which runs on the game loop thread, where
+-  // the client's context has to be current anyway.
+   for (IRenderBufferPool* bufferPool : m_processInfo.GetBufferManager().GetBufferPools())
+   {
+     bufferPool->EnableHardwareRendering(depth, stencil);
+ 
+     CRenderVideoSettings renderSettings;
+     if (bufferPool->IsCompatible(renderSettings))
+-      bSuccess = true;
++      m_hwBufferPools.emplace_back(bufferPool);
+   }
+ 
+-  if (!bSuccess)
++  if (m_hwBufferPools.empty())
++  {
+     CLog::Log(LOGERROR, "RetroPlayer[RENDER]: No buffer pool can render a {}x{} hardware frame",
+               width, height);
++    return false;
++  }
+ 
+-  return bSuccess;
++  CLog::Log(LOGDEBUG, "RetroPlayer[RENDER]: {} buffer pool(s) serving hardware rendering",
++            m_hwBufferPools.size());
++
++  return true;
+ }
+ 
+ uintptr_t CRPRenderManager::GetCurrentFramebuffer(unsigned int width, unsigned int height)
+ {
+-  for (IRenderBufferPool* bufferPool : m_processInfo.GetBufferManager().GetBufferPools())
++  // Deliberately not gated on HasVisibleRenderer(), unlike the software path.
++  // A hardware client needs somewhere to draw *before* it can produce its first
++  // frame, and a renderer is only created once a frame exists to show - so
++  // waiting for one deadlocks at a black screen with the client emulating
++  // happily into nothing. The software path gets away with the gate because
++  // AddFrame() caches frames until the GUI catches up.
++  for (IRenderBufferPool* bufferPool : m_hwBufferPools)
+   {
+-    if (!bufferPool->HasVisibleRenderer())
+-      continue;
+-
+     IRenderBuffer* renderBuffer = bufferPool->GetBuffer(width, height);
+     if (renderBuffer != nullptr)
+     {
+@@ -613,8 +619,17 @@ std::shared_ptr<CRPBaseRenderer> CRPRenderManager::GetRendererForSettings(
+   CRenderSettings effectiveRenderSettings;
+   effectiveRenderSettings.VideoSettings() = GetEffectiveSettings(renderSettings);
+ 
+-  // Check renderers in order of buffer pools
+-  for (IRenderBufferPool* bufferPool : m_processInfo.GetBufferManager().GetBufferPools())
++  // Check renderers in order of buffer pools. When a hardware client is running,
++  // only its pools are eligible: the software pools are still registered and
++  // still report themselves compatible, so they would win this search and
++  // render an empty buffer.
++  // GetBufferPools() returns by value, so this is a copy either way; spelling
++  // that out beats a ternary whose two arms have different value categories.
++  std::vector<IRenderBufferPool*> pools = m_hwBufferPools;
++  if (pools.empty())
++    pools = m_processInfo.GetBufferManager().GetBufferPools();
++
++  for (IRenderBufferPool* bufferPool : pools)
+   {
+     renderer = GetRendererForPool(bufferPool, effectiveRenderSettings);
+     if (renderer)
+diff --git a/xbmc/cores/RetroPlayer/rendering/RPRenderManager.h b/xbmc/cores/RetroPlayer/rendering/RPRenderManager.h
+index 424a13c..7bfa830 100644
+--- a/xbmc/cores/RetroPlayer/rendering/RPRenderManager.h
++++ b/xbmc/cores/RetroPlayer/rendering/RPRenderManager.h
+@@ -261,6 +261,15 @@ private:
+     IRenderBuffer* buffer;
+     uint8_t* memory;
+   };
++  /*!
++   * \brief Pools serving a hardware-rendering client, empty otherwise
++   *
++   * Set once by Create() before any frame flows, then read-only. The software
++   * pools stay registered and stay compatible, so without this the renderer
++   * lookup would pick one of them and display nothing.
++   */
++  std::vector<IRenderBufferPool*> m_hwBufferPools;
++
+   std::vector<PendingBuffer> m_pendingBuffers; // Only access from game thread
+   std::vector<IRenderBuffer*> m_renderBuffers;
+   std::map<AVPixelFormat, std::map<AVPixelFormat, SwsContext*>> m_scalers; // From -> to -> context

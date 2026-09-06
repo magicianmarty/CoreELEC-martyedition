@@ -1,0 +1,52 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: marty <marty@fyai.co.nz>
+Date: Sun, 6 Sep 2026 20:29:18 +1200
+Subject: [PATCH] RetroPlayer: mark the hardware pools before renderers are
+ built
+
+"Failed to configure buffer pool", logged every frame with a black screen. The
+renderer being configured was a software one, whose ConfigureInternal()
+switches on the pixel format and rejects AV_PIX_FMT_NONE - which is exactly what
+a hardware stream configures with, since the client renders into a texture we
+allocate and there is no format to agree on.
+
+OpenStream() called Configure() and then Create(). Configure() only moves the
+render manager to CONFIGURING; the rendering thread then builds renderers from
+whichever pools report themselves compatible. Create() is what records the
+hardware pools, so running it second lost the race every time.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+---
+ .../RetroPlayer/streams/RetroPlayerRendering.cpp   | 14 +++++++++++++-
+ 1 file changed, 13 insertions(+), 1 deletion(-)
+
+diff --git a/xbmc/cores/RetroPlayer/streams/RetroPlayerRendering.cpp b/xbmc/cores/RetroPlayer/streams/RetroPlayerRendering.cpp
+index 12a34eb..dc48bab 100644
+--- a/xbmc/cores/RetroPlayer/streams/RetroPlayerRendering.cpp
++++ b/xbmc/cores/RetroPlayer/streams/RetroPlayerRendering.cpp
+@@ -51,12 +51,24 @@ bool CRetroPlayerRendering::OpenStream(const StreamProperties& properties)
+   m_processInfo.SetVideoPixelFormat(pixelFormat);
+   m_processInfo.SetVideoDimensions(width, height);
+ 
++  // Create() before Configure(), not after. Configure() only moves the render
++  // manager to CONFIGURING; the rendering thread then builds renderers from
++  // whichever pools look compatible. Create() is what marks the hardware pools
++  // as the eligible ones, so doing it second loses the race - the software
++  // pool wins, and its ConfigureInternal() rejects AV_PIX_FMT_NONE with
++  // "Failed to configure buffer pool", every frame, forever.
++  //
++  // Safe in this order because the pools themselves are built by CRPProcessInfo
++  // long before either call.
++  if (!m_renderManager.Create(width, height, hwProperties.depth, hwProperties.stencil))
++    return false;
++
+   if (!m_renderManager.Configure(pixelFormat, width, height, displayAspectRatio, width, height))
+     return false;
+ 
+   CLog::Log(LOGDEBUG, "RetroPlayer[RENDERING]: Render manager configured");
+ 
+-  return m_renderManager.Create(width, height, hwProperties.depth, hwProperties.stencil);
++  return true;
+ }
+ 
+ void CRetroPlayerRendering::CloseStream()
