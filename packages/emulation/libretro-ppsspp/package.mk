@@ -15,21 +15,26 @@ PKG_GIT_CLONE_SINGLE="yes"
 PKG_GIT_SUBMODULE_DEPTH="1"
 PKG_DEPENDS_TARGET="toolchain"
 PKG_LONGDESC="PSP emulator"
-PKG_TOOLCHAIN="make"
+# PPSSPP's libretro target is CMake, not a libretro/Makefile: libretro/ holds a
+# CMakeLists.txt that the top-level build pulls in behind -DLIBRETRO=ON.
+PKG_TOOLCHAIN="cmake"
 
 PKG_LIBNAME="ppsspp_libretro.so"
-PKG_LIBPATH="libretro/${PKG_LIBNAME}"
+# CMake puts it in lib/ inside the build dir, unlike the make-based cores
+PKG_LIBPATH="lib/${PKG_LIBNAME}"
 PKG_LIBVAR="PPSSPP_LIB"
 
-PKG_MAKE_OPTS_TARGET="-C libretro platform=unix"
+# HEADLESS and UNITTEST are separate binaries we have no use for. The X11 and
+# Wayland switches matter more than they look: PPSSPP defaults USING_X11_VULKAN
+# to ON, and the configure then fails on X11_Xlib_INCLUDE_PATH-NOTFOUND for
+# every target in the tree, libretro included. This box has neither X11 nor
+# Wayland - Kodi is on GBM/DRM.
+PKG_CMAKE_OPTS_TARGET="-DLIBRETRO=ON -DHEADLESS=OFF -DUNITTEST=OFF \
+                       -DUSING_X11_VULKAN=OFF -DUSE_WAYLAND_WSI=OFF"
 
 if [ "${OPENGLES_SUPPORT}" = "yes" ]; then
   PKG_DEPENDS_TARGET+=" ${OPENGLES}"
-  PKG_MAKE_OPTS_TARGET+=" GLES=1 FORCE_GLES=1"
-fi
-
-if [ "${VULKAN_SUPPORT}" = "yes" ]; then
-  PKG_DEPENDS_TARGET+=" ${VULKAN}"
+  PKG_CMAKE_OPTS_TARGET+=" -DUSING_GLES2=ON -DUSING_EGL=ON"
 fi
 
 makeinstall_target() {
