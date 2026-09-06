@@ -1,0 +1,1 @@
+https://github.com/CoreELEC/CoreELEC/releases/download/22.0-Piers_beta1/CoreELEC-Amlogic-no.aarch64-22.0-Piers_beta1-Generic.img.gz
