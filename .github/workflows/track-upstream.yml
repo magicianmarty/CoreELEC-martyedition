@@ -37,7 +37,7 @@ jobs:
           base=$(git merge-base HEAD upstream/coreelec-22)
           head=$(git rev-parse upstream/coreelec-22)
           [ "$base" = "$head" ] && echo "moved=false" >> $GITHUB_OUTPUT || echo "moved=true" >> $GITHUB_OUTPUT
-          pin=$(git show upstream/coreelec-22:packages/mediacenter/kodi/package.mk | grep '^PKG_VERSION=' | cut -d'"' -f2)
+          pin=$(git show upstream/coreelec-22:projects/Amlogic-ce/packages/mediacenter/kodi/package.mk | grep '^PKG_VERSION=' | cut -d'"' -f2)
           echo "kodi_pin=$pin" >> $GITHUB_OUTPUT
           echo "upstream Kodi pin: $pin"
 
@@ -52,11 +52,18 @@ jobs:
             exit 1
           fi
 
-      - name: Confirm our patches still apply to Kodi's source
+      # packages/mediacenter/kodi is shadowed for this target by the project
+      # override, so its patches/ is never read. Ours live under the override.
+      - name: Confirm our patches are still where the build reads them
         if: steps.check.outputs.moved == 'true'
         run: |
-          ls packages/mediacenter/kodi/patches/10[1-9][0-9]-*.patch || true
-          echo "Ours are 1016 and above; upstream owns 1001-1015."
+          dir=projects/Amlogic-ce/packages/mediacenter/kodi/patches
+          found=$(ls "$dir"/10[2-9][0-9]-*.patch "$dir"/101[6-9]-*.patch 2>/dev/null | wc -l)
+          echo "$found patch(es) in $dir"
+          if [ "$found" -eq 0 ]; then
+            echo "::error::No patches found in $dir - a rebase has moved or dropped them"
+            exit 1
+          fi
 
       - name: Push
         if: steps.check.outputs.moved == 'true'
