@@ -13,6 +13,11 @@ set -euo pipefail
 PROJECT="${PROJECT:-Amlogic-ce}"
 DEVICE="${DEVICE:-Amlogic-no}"
 ARCH="${ARCH:-aarch64}"
+# Capped deliberately. binutils 2.47 has a parallel-build race that surfaces as
+# undefined references to symbols defined in its own tree; it failed at 32-way
+# on this machine and built clean at -j1. Raise it only if you are willing to
+# re-diagnose that failure.
+JOBS="${JOBS:-12}"
 IMAGE="coreelec-build:trixie"
 HERE="$(cd "$(dirname "$0")" && pwd)"
 
