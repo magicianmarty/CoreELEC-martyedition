@@ -8,7 +8,10 @@ PKG_VERSION="2.6.0"
 PKG_SHA256="d42fa374513180bb48cb11a46696f488240e5124ff1e6ad88b0abff706985612"
 PKG_LICENSE="GPL-2.0-or-later AND LGPL-2.1-or-later"
 PKG_SITE="https://savannah.nongnu.org/projects/attr"
-PKG_URL="http://download.savannah.nongnu.org/releases/attr/${PKG_NAME}-${PKG_VERSION}.tar.gz"
+# download.savannah.nongnu.org does not resolve from here (HTTP 000 / 502) and
+# neither mirror carries 2.6.0. The savannah mirror redirector serves the exact
+# pinned tarball - PKG_SHA256 is unchanged and verified against it.
+PKG_URL="https://download-mirror.savannah.gnu.org/releases/attr/${PKG_NAME}-${PKG_VERSION}.tar.gz"
 PKG_DEPENDS_TARGET="autotools:host gcc:host"
 PKG_LONGDESC="Extended Attributes Of Filesystem Objects."
 PKG_BUILD_FLAGS="+pic"
