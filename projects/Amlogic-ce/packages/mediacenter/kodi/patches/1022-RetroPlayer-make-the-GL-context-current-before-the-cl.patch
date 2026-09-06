@@ -1,0 +1,65 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: marty <marty@fyai.co.nz>
+Date: Sun, 6 Sep 2026 19:51:53 +1200
+Subject: [PATCH] RetroPlayer: make the GL context current before the client
+ runs
+
+mupen64plus-nx with its GLideN64 plugin segfaulted the moment it started, with a
+backtrace containing none of our code: retro_run() -> GLideN64 -> strstr() ->
+strchr(). That is strstr(glGetString(GL_EXTENSIONS), ...) on a NULL return.
+
+The pool created its EGL context lazily in CreateRenderBuffer(), which only runs
+when the client first asks for a framebuffer. But a client sets its renderer up
+in context_reset and during its first retro_run, before it asks for anything,
+and reads the extension string there. No current context, NULL, segfault inside
+the client.
+
+Creating it in EnableHardwareRendering() instead puts it on the right thread:
+that is reached from the client's own SET_HW_RENDER, and the crash log showed
+OpenStream() and the faulting retro_run() on the same thread.
+
+This is the ordering Kodi's OpenGL_Roadmap.md warns about under "GL Context
+Management" - contexts are thread-specific and rendering has to happen on the
+thread that owns one.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+---
+ .../buffers/RenderBufferPoolFBO.cpp           | 25 +++++++++++++++++++
+ 1 file changed, 25 insertions(+)
+
+diff --git a/xbmc/cores/RetroPlayer/buffers/RenderBufferPoolFBO.cpp b/xbmc/cores/RetroPlayer/buffers/RenderBufferPoolFBO.cpp
+index 781ff56..106f85a 100644
+--- a/xbmc/cores/RetroPlayer/buffers/RenderBufferPoolFBO.cpp
++++ b/xbmc/cores/RetroPlayer/buffers/RenderBufferPoolFBO.cpp
+@@ -36,6 +36,31 @@ void CRenderBufferPoolFBO::EnableHardwareRendering(bool depth, bool stencil)
+ {
+   m_depth = depth;
+   m_stencil = stencil;
++
++  // The context has to be current on this thread *now*, not lazily on the first
++  // GetBuffer(). A client sets up its renderer in context_reset and during its
++  // first retro_run, before it ever asks for a framebuffer, and the first thing
++  // it does there is read glGetString(GL_EXTENSIONS). With no current context
++  // that returns NULL and the client segfaults inside its own strstr() - which
++  // is what mupen64plus-nx did here, with a backtrace containing none of our
++  // code.
++  //
++  // This runs on the same thread as the game loop: CGameClientStreams::
++  // EnableHardwareRendering() is reached from the client's SET_HW_RENDER, and
++  // the crash log showed OpenStream() and the faulting retro_run() on one
++  // thread.
++  if (m_eglContext == EGL_NO_CONTEXT && !CreateContext())
++  {
++    CLog::Log(LOGERROR, "RetroPlayer[RENDER]: Cannot enable hardware rendering, no GL context");
++    return;
++  }
++
++  if (m_fboId == 0 && !CreateFramebuffer())
++  {
++    CLog::Log(LOGERROR, "RetroPlayer[RENDER]: Cannot enable hardware rendering, no framebuffer");
++    return;
++  }
++
+   m_active = true;
+ }
+ 
