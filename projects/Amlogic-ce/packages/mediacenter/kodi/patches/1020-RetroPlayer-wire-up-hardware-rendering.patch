@@ -1,0 +1,251 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: marty <marty@fyai.co.nz>
+Date: Sun, 6 Sep 2026 16:13:40 +1200
+Subject: [PATCH] RetroPlayer: wire up hardware rendering
+
+The machinery landed in the previous commits; this connects it.
+
+- IRenderBufferPool gains EnableHardwareRendering(depth, stencil), alongside
+  the DestroyContext() hook that is already there. Pools that cannot serve a
+  hardware client ignore it and keep answering IsCompatible() as before, so the
+  sysmem path is untouched.
+- CRPRenderManager::Create() activates the pools and reports whether any of
+  them took the job. No GL work happens here: the FBO pool creates its context
+  and framebuffer lazily in CreateRenderBuffer(), which runs on the game loop
+  thread, where the client's context has to be current anyway. That is what
+  makes the old "//! @todo This must be called from the rendering thread"
+  moot rather than ignored.
+- CRPRenderManager::RenderFrame() publishes the buffer the client rendered
+  into, mirroring the submitted-buffer branch of AddFrame(). There is no CPU
+  access to close here - a framebuffer was lent, not memory.
+- CRetroPlayerRendering::OpenStream() passes the client's real depth and
+  stencil requirements through and calls Create(); CloseStream() flushes, and
+  leaves the pools' GL resources to EndEvent(), which runs on the thread that
+  owns them.
+- CGameClientStreams::EnableHardwareRendering() stops returning false.
+
+Unproven: none of this can execute until the box runs the image. It is
+reachable only by a client that calls SET_HW_RENDER, and no such client is
+installed there with content to match, so the worst case is that hardware
+rendering still does not work - not that anything which works today stops.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+---
+ .../RetroPlayer/buffers/IRenderBufferPool.h   | 11 ++++
+ .../buffers/RenderBufferPoolFBO.cpp           |  2 +-
+ .../RetroPlayer/buffers/RenderBufferPoolFBO.h | 14 ++----
+ .../RetroPlayer/rendering/RPRenderManager.cpp | 50 +++++++++++++++++--
+ .../RetroPlayer/rendering/RPRenderManager.h   |  2 +-
+ .../streams/RetroPlayerRendering.cpp          | 15 +++---
+ .../addons/streams/GameClientStreams.cpp      |  4 +-
+ 7 files changed, 72 insertions(+), 26 deletions(-)
+
+diff --git a/xbmc/cores/RetroPlayer/buffers/IRenderBufferPool.h b/xbmc/cores/RetroPlayer/buffers/IRenderBufferPool.h
+index 3765186..e29fb37 100644
+--- a/xbmc/cores/RetroPlayer/buffers/IRenderBufferPool.h
++++ b/xbmc/cores/RetroPlayer/buffers/IRenderBufferPool.h
+@@ -79,6 +79,17 @@ public:
+    * pool can be safely recreated.
+    */
+   virtual void DestroyContext() {}
++
++  /*!
++   * \brief Take over rendering for a client that asked for a GL context
++   *
++   * Pools that cannot serve a hardware-rendering client ignore this and keep
++   * answering IsCompatible() as they did.
++   *
++   * \param depth The client needs a depth attachment
++   * \param stencil The client needs a stencil attachment
++   */
++  virtual void EnableHardwareRendering(bool depth, bool stencil) {}
+ };
+ } // namespace RETRO
+ } // namespace KODI
+diff --git a/xbmc/cores/RetroPlayer/buffers/RenderBufferPoolFBO.cpp b/xbmc/cores/RetroPlayer/buffers/RenderBufferPoolFBO.cpp
+index b14b497..781ff56 100644
+--- a/xbmc/cores/RetroPlayer/buffers/RenderBufferPoolFBO.cpp
++++ b/xbmc/cores/RetroPlayer/buffers/RenderBufferPoolFBO.cpp
+@@ -32,7 +32,7 @@ bool CRenderBufferPoolFBO::IsCompatible(const CRenderVideoSettings& renderSettin
+   return m_active;
+ }
+ 
+-void CRenderBufferPoolFBO::Activate(bool depth, bool stencil)
++void CRenderBufferPoolFBO::EnableHardwareRendering(bool depth, bool stencil)
+ {
+   m_depth = depth;
+   m_stencil = stencil;
+diff --git a/xbmc/cores/RetroPlayer/buffers/RenderBufferPoolFBO.h b/xbmc/cores/RetroPlayer/buffers/RenderBufferPoolFBO.h
+index 9a830d6..5a83a25 100644
+--- a/xbmc/cores/RetroPlayer/buffers/RenderBufferPoolFBO.h
++++ b/xbmc/cores/RetroPlayer/buffers/RenderBufferPoolFBO.h
+@@ -29,9 +29,9 @@ class CRenderContext;
+  * colour texture to.
+  *
+  * The pool reports itself incompatible with every render setting until
+- * Activate() is called. CRPRenderManager picks a renderer by walking the buffer
+- * pools and taking the first compatible one, so a pool that answered yes
+- * unconditionally would capture software-rendered clients as well.
++ * EnableHardwareRendering() is called. CRPRenderManager picks a renderer by
++ * walking the buffer pools and taking the first compatible one, so a pool that
++ * answered yes unconditionally would capture software clients as well.
+  */
+ class CRenderBufferPoolFBO : public CBaseRenderBufferPool
+ {
+@@ -42,17 +42,11 @@ public:
+   // implementation of IRenderBufferPool
+   bool IsCompatible(const CRenderVideoSettings& renderSettings) const override;
+   void DestroyContext() override;
++  void EnableHardwareRendering(bool depth, bool stencil) override;
+ 
+   // implementation of CBaseRenderBufferPool
+   IRenderBuffer* CreateRenderBuffer(void* header = nullptr) override;
+ 
+-  /*!
+-   * \brief Take over rendering for a client that asked for a GL context
+-   *
+-   * \param depth The client needs a depth attachment
+-   * \param stencil The client needs a stencil attachment
+-   */
+-  void Activate(bool depth, bool stencil);
+ 
+ protected:
+   bool CreateContext();
+diff --git a/xbmc/cores/RetroPlayer/rendering/RPRenderManager.cpp b/xbmc/cores/RetroPlayer/rendering/RPRenderManager.cpp
+index 2c795d2..043bb09 100644
+--- a/xbmc/cores/RetroPlayer/rendering/RPRenderManager.cpp
++++ b/xbmc/cores/RetroPlayer/rendering/RPRenderManager.cpp
+@@ -312,10 +312,27 @@ void CRPRenderManager::DestroyContext()
+     bufferPool->DestroyContext();
+ }
+ 
+-bool CRPRenderManager::Create(unsigned int width, unsigned int height)
++bool CRPRenderManager::Create(unsigned int width, unsigned int height, bool depth, bool stencil)
+ {
+-  //! @todo
+-  return false;
++  bool bSuccess = false;
++
++  // No GL work happens here. The pools create their context and framebuffer
++  // lazily in CreateRenderBuffer(), which runs on the game loop thread, where
++  // the client's context has to be current anyway.
++  for (IRenderBufferPool* bufferPool : m_processInfo.GetBufferManager().GetBufferPools())
++  {
++    bufferPool->EnableHardwareRendering(depth, stencil);
++
++    CRenderVideoSettings renderSettings;
++    if (bufferPool->IsCompatible(renderSettings))
++      bSuccess = true;
++  }
++
++  if (!bSuccess)
++    CLog::Log(LOGERROR, "RetroPlayer[RENDER]: No buffer pool can render a {}x{} hardware frame",
++              width, height);
++
++  return bSuccess;
+ }
+ 
+ uintptr_t CRPRenderManager::GetCurrentFramebuffer(unsigned int width, unsigned int height)
+@@ -340,7 +357,32 @@ uintptr_t CRPRenderManager::GetCurrentFramebuffer(unsigned int width, unsigned i
+ 
+ void CRPRenderManager::RenderFrame()
+ {
+-  //! @todo
++  if (m_bFlush || m_state != RENDER_STATE::CONFIGURED)
++    return;
++
++  // The client has finished rendering into the framebuffer it borrowed in
++  // GetCurrentFramebuffer(). Unlike AddFrame() there is no CPU access to close:
++  // a framebuffer was lent, not memory.
++  std::vector<IRenderBuffer*> renderBuffers;
++
++  for (const PendingBuffer& pending : m_pendingBuffers)
++  {
++    pending.buffer->Acquire();
++    renderBuffers.emplace_back(pending.buffer);
++    pending.buffer->Release();
++  }
++  m_pendingBuffers.clear();
++
++  if (renderBuffers.empty())
++    return;
++
++  {
++    std::unique_lock lock(m_bufferMutex);
++
++    for (auto renderBuffer : m_renderBuffers)
++      renderBuffer->Release();
++    m_renderBuffers = std::move(renderBuffers);
++  }
+ }
+ 
+ void CRPRenderManager::SetSpeed(double speed)
+diff --git a/xbmc/cores/RetroPlayer/rendering/RPRenderManager.h b/xbmc/cores/RetroPlayer/rendering/RPRenderManager.h
+index ff7d2a0..424a13c 100644
+--- a/xbmc/cores/RetroPlayer/rendering/RPRenderManager.h
++++ b/xbmc/cores/RetroPlayer/rendering/RPRenderManager.h
+@@ -108,7 +108,7 @@ public:
+   //! @todo These are only examples pulled from the history of the OpenGL
+   //! effort and the required redesign will probably remove or change these
+   //! functions.
+-  bool Create(unsigned int width, unsigned int height);
++  bool Create(unsigned int width, unsigned int height, bool depth, bool stencil);
+   uintptr_t GetCurrentFramebuffer(unsigned int width, unsigned int height);
+   void RenderFrame();
+ 
+diff --git a/xbmc/cores/RetroPlayer/streams/RetroPlayerRendering.cpp b/xbmc/cores/RetroPlayer/streams/RetroPlayerRendering.cpp
+index 79e5259..12a34eb 100644
+--- a/xbmc/cores/RetroPlayer/streams/RetroPlayerRendering.cpp
++++ b/xbmc/cores/RetroPlayer/streams/RetroPlayerRendering.cpp
+@@ -34,10 +34,12 @@ CRetroPlayerRendering::~CRetroPlayerRendering()
+ 
+ bool CRetroPlayerRendering::OpenStream(const StreamProperties& properties)
+ {
+-  [[maybe_unused]] const HwFramebufferProperties& hwProperties =
++  const HwFramebufferProperties& hwProperties =
+       static_cast<const HwFramebufferProperties&>(properties);
+ 
+-  //! @todo
++  // The client renders into a texture we allocate, so there is no pixel format
++  // to agree on. Dimensions are nominal: the client passes the real ones to
++  // GetStreamBuffer() every frame, and the buffer pool allocates per size.
+   const AVPixelFormat pixelFormat = AV_PIX_FMT_NONE;
+   const unsigned int width = 640;
+   const unsigned int height = 480;
+@@ -54,17 +56,16 @@ bool CRetroPlayerRendering::OpenStream(const StreamProperties& properties)
+ 
+   CLog::Log(LOGDEBUG, "RetroPlayer[RENDERING]: Render manager configured");
+ 
+-  //! @todo: This must be called from the rendering thread
+-  //return m_renderManager.Create(width, height);
+-
+-  return false;
++  return m_renderManager.Create(width, height, hwProperties.depth, hwProperties.stencil);
+ }
+ 
+ void CRetroPlayerRendering::CloseStream()
+ {
+   CLog::Log(LOGDEBUG, "RetroPlayer[RENDERING]: Closing rendering stream");
+ 
+-  //! @todo
++  // The pools' GL resources belong to the game loop thread's context and are
++  // released from EndEvent(), not here
++  m_renderManager.Flush();
+ }
+ 
+ bool CRetroPlayerRendering::GetStreamBuffer(unsigned int width,
+diff --git a/xbmc/games/addons/streams/GameClientStreams.cpp b/xbmc/games/addons/streams/GameClientStreams.cpp
+index fce7a05..4fd16f6 100644
+--- a/xbmc/games/addons/streams/GameClientStreams.cpp
++++ b/xbmc/games/addons/streams/GameClientStreams.cpp
+@@ -113,9 +113,7 @@ bool CGameClientStreams::EnableHardwareRendering(const game_hw_rendering_propert
+   // Store hardware rendering properties
+   m_hwProperties = properties;
+ 
+-  //! @todo Finish OpenGL support
+-  CLog::Log(LOGERROR, "Hardware rendering not implemented");
+-  return false;
++  return true;
+ }
+ 
+ game_proc_address_t CGameClientStreams::GetHwProcedureAddress(const char* symbol)

@@ -11,10 +11,11 @@ and ends:
 There is no software rasteriser in the libretro build and no HAVE_OPENGL=0
 switch in its Makefile.
 
-The false value is worse than a missing one. requires_opengl=true is what makes
-Kodi hide a game client it cannot drive, which is why mupen64plus-nx sits inert
-rather than failing. Declared false, Kodi offers flycast for every .chd, .gdi
-and .cdi in the library and then fails at load.
+Kodi 22 never reads this field - there is not one reference to requires_opengl
+anywhere in xbmc - so this changes no behaviour today. It is corrected because
+it is the only machine-readable statement the addon makes about what it needs,
+every other core in the repo gets it right, and a frontend that starts honouring
+it should hide flycast rather than offer it and fail at load.
 
 --- a/game.libretro.flycast/addon.xml.in
 +++ b/game.libretro.flycast/addon.xml.in
