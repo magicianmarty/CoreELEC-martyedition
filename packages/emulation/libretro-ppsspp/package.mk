@@ -9,7 +9,9 @@ PKG_SITE="https://github.com/hrydgard/ppsspp"
 # submodules and a GitHub archive contains none of them.
 PKG_URL="https://github.com/hrydgard/ppsspp.git"
 PKG_GIT_CLONE_SINGLE="yes"
-PKG_GIT_CLONE_DEPTH="1"
+# No PKG_GIT_CLONE_DEPTH: get_git verifies the pin with `git log | grep`, and a
+# depth-1 clone only contains the branch tip, so a pinned older commit is
+# unreachable and the build aborts. Submodules are still shallow.
 PKG_GIT_SUBMODULE_DEPTH="1"
 PKG_DEPENDS_TARGET="toolchain"
 PKG_LONGDESC="PSP emulator"

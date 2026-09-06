@@ -1,0 +1,19 @@
+From: marty <marty@fyai.co.nz>
+Subject: [PATCH] libzip: include unistd.h on POSIX, not just Apple and Switch
+
+_zip_create_temp_output() calls close(), but unistd.h is included only for
+__APPLE__ and __SWITCH__. Every other POSIX target relied on the compiler
+implicitly declaring it, which GCC 14 turned from a warning into an error in
+all C modes - so -std=gnu17 does not bring it back.
+
+--- a/core/deps/libzip/zip_close.c
++++ b/core/deps/libzip/zip_close.c
+@@ -44,7 +44,7 @@
+ 
+ #include "zipint.h"
+ 
+-#if defined(__APPLE__) || defined(__SWITCH__)
++#if defined(__APPLE__) || defined(__SWITCH__) || defined(__unix__)
+ #include <unistd.h>
+ #endif
+ 

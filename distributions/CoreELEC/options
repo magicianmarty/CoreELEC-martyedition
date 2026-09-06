@@ -46,7 +46,11 @@
   HARDENING_SUPPORT="no"
 
 # Default supported get handlers (archive, git, file etc.)
-  GET_HANDLER_SUPPORT="archive"
+# git is enabled for PPSSPP, whose libretro build needs submodules a GitHub
+# archive cannot carry (libretro-common, ffmpeg, glslang, SPIRV-Cross, zstd,
+# rapidjson, cpu_features). scripts/get_git already handles this - it was only
+# ever gated off here. No upstream package uses a git URL, so this is additive.
+  GET_HANDLER_SUPPORT="archive git"
 
 # use local ccache on build host, if available, for early package
 # builds before ccache has been built
