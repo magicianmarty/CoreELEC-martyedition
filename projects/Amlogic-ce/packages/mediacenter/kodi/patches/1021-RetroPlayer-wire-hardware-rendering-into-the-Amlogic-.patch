@@ -1,0 +1,89 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: marty <marty@fyai.co.nz>
+Date: Sun, 6 Sep 2026 18:13:14 +1200
+Subject: [PATCH] RetroPlayer: wire hardware rendering into the Amlogic window
+ system
+
+The FBO renderer was registered in the GBM window system, which this hardware
+never uses: CoreELEC builds Kodi with CORE_PLATFORM_NAME=aml and has its own
+WinSystemAmlogic. On the box the log showed only "Registering renderer factory
+for OpenGLES" - the FBO factory existed in the binary and nothing ever
+constructed it.
+
+Two changes, both specific to this platform:
+
+- WinSystemAmlogic registers CRendererFactoryFBO, last, for the same reason as
+  GBM: CRPRenderManager takes the first compatible buffer pool, and the FBO pool
+  only reports itself compatible once a client has asked for a hardware context.
+- CRPProcessInfoAmlogic derives from CRPProcessInfoEGL rather than
+  CRPProcessInfo. It was inheriting the base GetHwProcedureAddress(), which
+  returns nullptr, so a core could never have resolved a single GL symbol even
+  once a renderer existed. CRPProcessInfoEGL resolves through eglGetProcAddress
+  and is already built wherever EGL is.
+
+Found by flashing the image and reading which factories actually registered,
+which is the only way this would have surfaced.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+---
+ .../RetroPlayer/process/amlogic/RPProcessInfoAmlogic.cpp     | 2 +-
+ .../cores/RetroPlayer/process/amlogic/RPProcessInfoAmlogic.h | 4 ++--
+ xbmc/windowing/amlogic/WinSystemAmlogic.cpp                  | 5 +++++
+ 3 files changed, 8 insertions(+), 3 deletions(-)
+
+diff --git a/xbmc/cores/RetroPlayer/process/amlogic/RPProcessInfoAmlogic.cpp b/xbmc/cores/RetroPlayer/process/amlogic/RPProcessInfoAmlogic.cpp
+index ef63b51..e76fbda 100644
+--- a/xbmc/cores/RetroPlayer/process/amlogic/RPProcessInfoAmlogic.cpp
++++ b/xbmc/cores/RetroPlayer/process/amlogic/RPProcessInfoAmlogic.cpp
+@@ -12,7 +12,7 @@ using namespace KODI;
+ using namespace RETRO;
+ 
+ CRPProcessInfoAmlogic::CRPProcessInfoAmlogic() :
+-  CRPProcessInfo("Amlogic")
++  CRPProcessInfoEGL("Amlogic")
+ {
+ }
+ 
+diff --git a/xbmc/cores/RetroPlayer/process/amlogic/RPProcessInfoAmlogic.h b/xbmc/cores/RetroPlayer/process/amlogic/RPProcessInfoAmlogic.h
+index c02df00..2479b7a 100644
+--- a/xbmc/cores/RetroPlayer/process/amlogic/RPProcessInfoAmlogic.h
++++ b/xbmc/cores/RetroPlayer/process/amlogic/RPProcessInfoAmlogic.h
+@@ -8,13 +8,13 @@
+ 
+ #pragma once
+ 
+-#include "cores/RetroPlayer/process/RPProcessInfo.h"
++#include "cores/RetroPlayer/process/egl/RPProcessInfoEGL.h"
+ 
+ namespace KODI
+ {
+ namespace RETRO
+ {
+-  class CRPProcessInfoAmlogic : public CRPProcessInfo
++  class CRPProcessInfoAmlogic : public CRPProcessInfoEGL
+   {
+   public:
+     CRPProcessInfoAmlogic();
+diff --git a/xbmc/windowing/amlogic/WinSystemAmlogic.cpp b/xbmc/windowing/amlogic/WinSystemAmlogic.cpp
+index 48aa0f5..3cdb091 100644
+--- a/xbmc/windowing/amlogic/WinSystemAmlogic.cpp
++++ b/xbmc/windowing/amlogic/WinSystemAmlogic.cpp
+@@ -13,6 +13,7 @@
+ 
+ #include "ServiceBroker.h"
+ #include "cores/RetroPlayer/process/amlogic/RPProcessInfoAmlogic.h"
++#include "cores/RetroPlayer/rendering/VideoRenderers/RPRendererFBO.h"
+ #include "cores/RetroPlayer/rendering/VideoRenderers/RPRendererOpenGLES.h"
+ #include "cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecAmlogic.h"
+ #include "cores/VideoPlayer/VideoRenderers/LinuxRendererGLES.h"
+@@ -307,6 +308,10 @@ bool CWinSystemAmlogic::InitWindowSystem()
+   CLinuxRendererGLES::Register();
+   RETRO::CRPProcessInfoAmlogic::Register();
+   RETRO::CRPProcessInfoAmlogic::RegisterRendererFactory(new RETRO::CRendererFactoryOpenGLES);
++  // Registered last: CRPRenderManager takes the first buffer pool that reports
++  // itself compatible, and the FBO pool only does so once a game client has
++  // asked for a hardware context
++  RETRO::CRPProcessInfoAmlogic::RegisterRendererFactory(new RETRO::CRendererFactoryFBO);
+   CRendererAML::Register();
+   CScreenshotSurfaceGLES::Register();
+ 
