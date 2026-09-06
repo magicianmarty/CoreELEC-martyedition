@@ -23,5 +23,6 @@ podman image exists "$IMAGE" || podman build -t "$IMAGE" -f "$HERE/Containerfile
 exec podman run --rm --userns=keep-id \
   -v "$(cd "$HERE/.." && pwd):/work:z" -w /work \
   -e PROJECT="$PROJECT" -e DEVICE="$DEVICE" -e ARCH="$ARCH" \
+  -e CONCURRENCY_MAKE_LEVEL="$JOBS" \
   -e HOME=/work/.buildhome \
   "$IMAGE" bash -lc 'mkdir -p "$HOME" && make image'
