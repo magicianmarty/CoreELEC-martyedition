@@ -1,0 +1,104 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: marty <marty@fyai.co.nz>
+Date: Sun, 6 Sep 2026 21:51:48 +1200
+Subject: [PATCH] Games: defer the hardware context reset out of stream opening
+
+A client that renders through libretro's GL state manager rendered to the
+default framebuffer forever, silently, with no error raised anywhere.
+
+CGameClientStreamHwFramebuffer::OpenStream() dispatched HardwareContextReset()
+directly. That runs inside the add-on's own CStream::Open(), and CStream assigns
+its handle only once that call returns - so throughout the reset the add-on
+believes its stream is shut, and CVideoStream::GetHwFramebuffer() takes its
+!IsOpen() early return and answers 0.
+
+Early would be survivable if anything asked again. Nothing does: glsm queries
+get_current_framebuffer() exactly once, in glsm_state_setup(), and caches it as
+default_framebuffer for the session - and the client runs that setup from inside
+context_reset. One zero there is permanent.
+
+The request is now recorded and dispatched at the top of RunFrame(), by which
+point CStream::Open() has returned and the add-on's handle is set. Costs one
+frame before the client initialises.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+---
+ xbmc/games/addons/GameClient.cpp | 26 ++++++++++++++++++++++++++
+ xbmc/games/addons/GameClient.h   | 13 +++++++++++++
+ 2 files changed, 39 insertions(+)
+
+diff --git a/xbmc/games/addons/GameClient.cpp b/xbmc/games/addons/GameClient.cpp
+index 8819317..b7ffcdf 100644
+--- a/xbmc/games/addons/GameClient.cpp
++++ b/xbmc/games/addons/GameClient.cpp
+@@ -567,6 +567,11 @@ void CGameClient::RunFrame()
+ 
+   if (m_bIsPlaying)
+   {
++    // Before the client runs, not while it is opening a stream. See
++    // HardwareContextReset() for why this cannot be dispatched where it is
++    // requested.
++    DispatchPendingHardwareContextReset();
++
+     try
+     {
+       LogError(m_ifc.game->toAddon->RunFrame(m_ifc.game), "RunFrame()");
+@@ -785,6 +790,27 @@ void CGameClient::LogException(const char* strFunctionName) const
+ 
+ void CGameClient::HardwareContextReset()
+ {
++  // Deferred to the next RunFrame() rather than dispatched here.
++  //
++  // This is reached from CGameClientStreamHwFramebuffer::OpenStream(), which
++  // runs inside the add-on's own CStream::Open() - and CStream only assigns its
++  // handle once that call *returns*. So during a context reset dispatched from
++  // here the add-on still believes its stream is shut, and every
++  // get_current_framebuffer() it makes on the client's behalf answers 0.
++  //
++  // That is fatal rather than merely early: libretro's GL state manager asks
++  // exactly once, in glsm_state_setup(), and caches the answer for the session.
++  // A client told 0 there renders to the default framebuffer forever, silently.
++  m_bPendingHwContextReset = true;
++}
++
++void CGameClient::DispatchPendingHardwareContextReset()
++{
++  if (!m_bPendingHwContextReset.exchange(false))
++    return;
++
++  CLog::Log(LOGDEBUG, "GAME: Dispatching deferred hardware context reset");
++
+   try
+   {
+     LogError(m_ifc.game->toAddon->HwContextReset(m_ifc.game), "HwContextReset()");
+diff --git a/xbmc/games/addons/GameClient.h b/xbmc/games/addons/GameClient.h
+index e4d09e4..b1b5e81 100644
+--- a/xbmc/games/addons/GameClient.h
++++ b/xbmc/games/addons/GameClient.h
+@@ -234,6 +234,14 @@ public:
+   // Implementation of IHwFramebufferCallback
+   void HardwareContextReset() override;
+ 
++  /*!
++   * \brief Dispatch a hardware context reset that was requested while the
++   *        add-on was still opening its stream
++   *
++   * Called from the game loop, where the add-on's stream handle is valid.
++   */
++  void DispatchPendingHardwareContextReset();
++
+   /*!
+    * @brief To get the interface table used between addon and kodi
+    * @todo This function becomes removed after old callback library system
+@@ -327,6 +335,11 @@ private:
+ 
+   // Properties of the current playing file
+   std::atomic_bool m_bIsPlaying; // True between OpenFile() and CloseFile()
++
++  // Set when a stream asks for a hardware context reset, cleared when RunFrame()
++  // dispatches it. Written from the thread opening the stream, read from the
++  // game loop.
++  std::atomic<bool> m_bPendingHwContextReset{false};
+   std::atomic_bool m_hasFrameRun{false};
+   // The speed the player is running at, as a multiple of normal speed. Written
+   // by the thread that changes the speed and read by the client's own, so it is
