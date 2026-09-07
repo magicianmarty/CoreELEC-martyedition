@@ -50,7 +50,7 @@ Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
  #include "ServiceBroker.h"
  #include "XBDateTime.h"
  #include "addons/AddonVersion.h"
-@@ -36,17 +49,47 @@
+@@ -36,17 +49,52 @@
  
  #define REWIND_FACTOR 0.25 // Rewind at 25% of gameplay speed
  
@@ -95,11 +95,16 @@ Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
      m_savestateDatabase(new CSavestateDatabase)
  {
 +  m_runAheadFrames = GetRunAheadFrames();
++  // Said out loud because everything else about run-ahead is invisible: it
++  // only logs when it fails, so silence otherwise means either "working" or
++  // "never switched on", and those are not the same thing.
++  if (m_runAheadFrames > 0)
++    CLog::Log(LOGINFO, "RetroPlayer[RUNAHEAD]: Running {} frame(s) ahead", m_runAheadFrames);
 +
    UpdateMemoryStream();
  
    GAME::CGameSettings& gameSettings = CServiceBroker::GetGameServices().GameSettings();
-@@ -355,12 +398,73 @@
+@@ -355,12 +403,73 @@
  
  void CReversiblePlayback::FrameEvent()
  {
