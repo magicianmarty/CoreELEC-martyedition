@@ -1,0 +1,65 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: marty <marty@fyai.co.nz>
+Date: Sun, 7 Sep 2026 23:00:00 +1200
+Subject: [PATCH] Subtitles: put the size in the in-player dialog
+
+The subtitle dialog reachable while a video plays offers enable, delay, stream,
+browse and search - everything except the one thing you look at the subtitles
+and want to change. Size lives in Kodi's settings tree at level Advanced, so on
+a box left at the default Standard level it is never drawn at all, and reaching
+it means raising a global settings level and leaving whatever you are watching.
+
+Adding it here puts it on the one screen that is open while the subtitles are
+in front of you to be judged against. CSubtitlesSettings already registers a
+callback on subtitles.fontsize and notifies its observers, so the change lands
+immediately instead of on the next video.
+
+The range is Kodi's own: 12 to 74 in steps of 2.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+---
+--- a/xbmc/video/dialogs/GUIDialogSubtitleSettings.cpp
++++ b/xbmc/video/dialogs/GUIDialogSubtitleSettings.cpp
+@@ -50,6 +50,9 @@
+ #define SETTING_SUBTITLE_STREAM                "subtitles.stream"
+ #define SETTING_SUBTITLE_BROWSER               "subtitles.browser"
+ #define SETTING_SUBTITLE_SEARCH                "subtitles.search"
++// Distinct from CSettings::SETTING_SUBTITLES_FONTSIZE: this dialog keeps its
++// settings in its own manager, and reusing the id there invites confusion.
++#define SETTING_SUBTITLE_FONTSIZE             "subtitles.osdfontsize"
+ #define SETTING_MAKE_DEFAULT                   "audio.makedefault"
+ 
+ CGUIDialogSubtitleSettings::CGUIDialogSubtitleSettings()
+@@ -117,6 +120,12 @@
+     m_subtitleStream = std::static_pointer_cast<const CSettingInt>(setting)->GetValue();
+     appPlayer->SetSubtitle(m_subtitleStream);
+   }
++  else if (settingId == SETTING_SUBTITLE_FONTSIZE)
++  {
++    const int value = std::static_pointer_cast<const CSettingInt>(setting)->GetValue();
++    CServiceBroker::GetSettingsComponent()->GetSettings()->SetInt(
++        CSettings::SETTING_SUBTITLES_FONTSIZE, value);
++  }
+ }
+ 
+ std::string CGUIDialogSubtitleSettings::BrowseForSubtitle()
+@@ -318,6 +327,19 @@
+     std::static_pointer_cast<CSettingControlSlider>(settingSubtitleDelay->GetControl())->SetFormatter(SettingFormatterDelay);
+   }
+ 
++  // subtitle size setting
++  //
++  // The only place a viewer can reach this. Kodi keeps subtitles.fontsize at
++  // settings level Advanced, so on a box left at the default Standard level it
++  // is not merely buried, it is never drawn - and it was absent from here, the
++  // one screen open while the subtitles are on screen to be judged against.
++  // CSubtitlesSettings watches the setting and notifies its observers, so the
++  // change shows immediately rather than on the next video.
++  AddSpinner(groupSubtitles, SETTING_SUBTITLE_FONTSIZE, 289, SettingLevel::Basic,
++             CServiceBroker::GetSettingsComponent()->GetSettings()->GetInt(
++                 CSettings::SETTING_SUBTITLES_FONTSIZE),
++             12, 2, 74);
++
+   // subtitle stream setting
+   if (SupportsSubtitleFeature(IPlayerSubtitleCaps::SELECT_STREAM))
+     AddSubtitleStreams(groupSubtitles, SETTING_SUBTITLE_STREAM);

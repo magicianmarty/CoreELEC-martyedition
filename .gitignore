@@ -42,3 +42,4 @@ tools/mkpkg/*.git
 # ignore old linux configs
 projects/**/*.old
 *.log
+.buildhome/
