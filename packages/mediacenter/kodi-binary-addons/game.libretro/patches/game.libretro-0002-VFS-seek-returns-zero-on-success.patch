@@ -1,0 +1,34 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: marty <marty@fyai.co.nz>
+Date: Sun, 7 Sep 2026 15:25:00 +1200
+Subject: [PATCH] VFS: seek returns zero on success
+
+Every core that sizes a file by seeking to its end saw zero bytes.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+---
+diff --git a/src/libretro/FrontendBridge.cpp b/src/libretro/FrontendBridge.cpp
+--- a/src/libretro/FrontendBridge.cpp
++++ b/src/libretro/FrontendBridge.cpp
+@@ -513,9 +513,18 @@
+   if (newOffset < 0)
+     return -1;
+ 
+-  // Return the resulting offset location as measured in bytes from the
+-  // beginning of the file
+-  return newOffset;
++  // Zero on success, not the new offset.
++  //
++  // libretro.h documents this as "returns the resulting offset location", but
++  // the reference implementation returns fseeko()'s value - zero on success -
++  // and cores are written against that. PPSSPP asks for a file's size with
++  //
++  //     if (Fseek(f, 0, SEEK_END) != 0) return 0;
++  //     size = Ftell(f);
++  //
++  // so returning the offset made every file it opened look like zero bytes,
++  // and it rejected a 686 MB disc image as "too small to read the header".
++  return 0;
+ }
+ 
+ int64_t CFrontendBridge::ReadFile(retro_vfs_file_handle *stream, void *s, uint64_t len)

@@ -1,0 +1,88 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: marty <marty@fyai.co.nz>
+Date: Sun, 7 Sep 2026 17:35:00 +1200
+Subject: [PATCH] Provide the clear-thread-waits callback
+
+Closing a Dreamcast game segfaulted inside Flycast's retro_unload_game(),
+jumping through a null pointer, and took Kodi with it.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+---
+diff --color -ruN tw-a/libretro/FrontendBridge.cpp tw-b/libretro/FrontendBridge.cpp
+--- a/src/libretro/FrontendBridge.cpp	2026-09-07 17:32:33.333987121 +1200
++++ b/src/libretro/FrontendBridge.cpp	2026-09-07 17:34:06.595374523 +1200
+@@ -265,6 +265,17 @@
+   return true;
+ }
+ 
++bool CFrontendBridge::ClearAllThreadWaits(unsigned int cmd, void* data)
++{
++  // Nothing to clear. Present so that a client which asks for this callback
++  // has something safe to call - see the environment handler for why silence
++  // is not an option.
++  (void)cmd;
++  (void)data;
++
++  return true;
++}
++
+ void CFrontendBridge::LedSetState(int led, int state)
+ {
+   if (!CLibretroEnvironment::Get().GetAddon())
+diff --color -ruN tw-a/libretro/FrontendBridge.h tw-b/libretro/FrontendBridge.h
+--- a/src/libretro/FrontendBridge.h	2026-09-07 17:32:33.333987121 +1200
++++ b/src/libretro/FrontendBridge.h	2026-09-07 17:34:06.595529375 +1200
+@@ -44,6 +44,7 @@
+     static uintptr_t HwGetCurrentFramebuffer(void);
+     static retro_proc_address_t HwGetProcAddress(const char *sym);
+     static bool RumbleSetState(unsigned port, retro_rumble_effect effect, uint16_t strength);
++    static bool ClearAllThreadWaits(unsigned int cmd, void* data);
+     static void LedSetState(int led, int state);
+     static bool SensorSetState(unsigned port, retro_sensor_action action, unsigned rate);
+     static float SensorGetInput(unsigned port, unsigned id);
+diff --color -ruN tw-a/libretro/LibretroEnvironment.cpp tw-b/libretro/LibretroEnvironment.cpp
+--- a/src/libretro/LibretroEnvironment.cpp	2026-09-07 17:32:33.333987121 +1200
++++ b/src/libretro/LibretroEnvironment.cpp	2026-09-07 17:34:06.595039978 +1200
+@@ -21,6 +21,17 @@
+ 
+ using namespace LIBRETRO;
+ 
++// A RetroArch extension rather than part of libretro proper, so it is absent
++// from the libretro.h we build against. Cores that use it define it the same
++// way - see Flycast's core/libretro/libretro.cpp.
++#ifndef RETRO_ENVIRONMENT_RETROARCH_START_BLOCK
++#define RETRO_ENVIRONMENT_RETROARCH_START_BLOCK 0x800000
++#endif
++#ifndef RETRO_ENVIRONMENT_GET_CLEAR_ALL_THREAD_WAITS_CB
++#define RETRO_ENVIRONMENT_GET_CLEAR_ALL_THREAD_WAITS_CB \
++  (3 | RETRO_ENVIRONMENT_RETROARCH_START_BLOCK)
++#endif
++
+ namespace LIBRETRO
+ {
+   bool EnvCallback(unsigned cmd, void* data)
+@@ -653,6 +664,24 @@
+     }
+     break;
+   }
++  case RETRO_ENVIRONMENT_GET_CLEAR_ALL_THREAD_WAITS_CB:
++  {
++    // Hand the client something to call, even though there is nothing to do.
++    //
++    // A core that renders on its own thread asks for this so it can tell the
++    // frontend to drop any waits before it joins that thread, which is how
++    // RetroArch avoids deadlocking itself on shutdown. We hold no such waits.
++    //
++    // Ignoring the request is not a safe answer: the pointer stays as the core
++    // initialised it, and Flycast initialises it to NULL and then calls it
++    // unconditionally in retro_unload_game(), so closing a Dreamcast game
++    // jumped through a null pointer and took Kodi with it.
++    retro_environment_t* typedData = static_cast<retro_environment_t*>(data);
++    if (typedData)
++      *typedData = CFrontendBridge::ClearAllThreadWaits;
++
++    break;
++  }
+   case RETRO_ENVIRONMENT_GET_LED_INTERFACE:
+   {
+     retro_led_interface* typedData = static_cast<retro_led_interface*>(data);

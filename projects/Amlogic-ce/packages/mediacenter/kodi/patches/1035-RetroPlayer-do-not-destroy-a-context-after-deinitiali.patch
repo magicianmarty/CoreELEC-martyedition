@@ -1,0 +1,56 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: marty <marty@fyai.co.nz>
+Date: Sun, 7 Sep 2026 16:45:00 +1200
+Subject: [PATCH] RetroPlayer: do not destroy a context after deinitialising
+
+Closing a hardware-rendered game segfaulted on the way out:
+
+    pthread_mutex_lock
+    CRenderBufferManager::GetBufferPools
+    CRPRenderManager::DestroyContext
+    CThread::Action
+
+DestroyContext() is driven by the game loop's EndEvent(), which can arrive
+after the player has destroyed CRPProcessInfo - and m_processInfo is a
+reference to it, so the buffer manager's mutex was already freed.
+
+Deinitialize() now releases the hardware buffer and pools itself, while process
+info is still alive, and DestroyContext() returns early once that has happened.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+---
+--- a/xbmc/cores/RetroPlayer/rendering/RPRenderManager.cpp	2026-09-07 17:03:30.882489536 +1200
++++ b/xbmc/cores/RetroPlayer/rendering/RPRenderManager.cpp	2026-09-07 17:03:30.902937206 +1200
+@@ -96,6 +96,12 @@
+   }
+   m_savestateBuffers.clear();
+ 
++  // The hardware side goes here too, not only in DestroyContext(). This runs
++  // while CRPProcessInfo is still alive; DestroyContext() is driven by the
++  // game loop's EndEvent() and can arrive after the player has torn it down.
++  ReleaseHwRenderBuffer();
++  m_hwBufferPools.clear();
++
+   // Renderers may still hold GPU resources, so defer cleanup to the rendering
+   // or destructor thread
+   {
+@@ -308,6 +314,19 @@
+ 
+ void CRPRenderManager::DestroyContext()
+ {
++  // Nothing to do once Deinitialize() has run, and m_processInfo below is a
++  // reference the player owns: closing a hardware-rendered game segfaulted on
++  // the way out, because the game loop's EndEvent() arrives after the player
++  // has destroyed it and this walked a freed mutex.
++  //
++  //   CRenderBufferManager::GetBufferPools
++  //   CRPRenderManager::DestroyContext
++  //
++  // Deinitialize() releases the hardware buffer and pools itself, while
++  // CRPProcessInfo is still alive, so there is nothing left to free here.
++  if (m_state == RENDER_STATE::UNCONFIGURED)
++    return;
++
+   // Order matters: the buffer owns GL objects created in the pool's context, so
+   // it has to go first. This runs from EndEvent(), on the game loop thread that
+   // made the context current, which is the only thread allowed to free them.

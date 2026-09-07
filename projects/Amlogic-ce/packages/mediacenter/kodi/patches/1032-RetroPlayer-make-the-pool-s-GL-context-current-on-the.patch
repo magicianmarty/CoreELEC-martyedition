@@ -1,0 +1,127 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: marty <marty@fyai.co.nz>
+Date: Sun, 7 Sep 2026 14:35:00 +1200
+Subject: [PATCH] RetroPlayer: make the pool's GL context current on the game
+ loop
+
+Hardware rendering reached the point of running the client without crashing and
+still showed nothing, with the emulated CPU pinned at 100% in a tight loop of
+recompiled code that never reached a vertical interrupt.
+
+EGL contexts are current per thread, and the two threads here are not the same
+one. Patch 1022 creates the pool's context in EnableHardwareRendering() and
+makes it current there, which is reached from the client's SET_HW_RENDER - on
+Kodi's player thread. The client then renders from the game loop:
+
+    T:11503  Enabling hardware rendering for OpenGLES 3.0
+    T:11599  Hardware framebuffer 1 ready at 640x480
+    T:11599  GAME: Dispatching deferred hardware context reset
+    T:11599  mupen64plus: [EmuThread] M64CMD_EXECUTE
+
+So every GL call GLideN64 made ran against no current context. It drew nothing
+and never signalled a finished frame, and the game sat waiting for one - which
+is why sampling the game loop only ever landed in the dynarec's JIT buffer and
+never in the graphics plugin.
+
+Binding it in GetCurrentFramebuffer() puts it on whichever thread is actually
+asking. That is the one call the client makes from the game loop before it
+renders, on every frame as well as during context_reset, and it is already
+required to be cheap and non-blocking. eglMakeCurrent on a context that is
+already current is skipped outright.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+---
+diff --color -ruN a/cores/RetroPlayer/buffers/IRenderBufferPool.h b/cores/RetroPlayer/buffers/IRenderBufferPool.h
+--- a/xbmc/cores/RetroPlayer/buffers/IRenderBufferPool.h	2026-09-07 14:37:17.476315705 +1200
++++ b/xbmc/cores/RetroPlayer/buffers/IRenderBufferPool.h	2026-09-07 14:37:17.498071775 +1200
+@@ -99,6 +99,15 @@
+    * scaling method they support, hardware client or not.
+    */
+   virtual bool IsHardwareRendering() const { return false; }
++
++  /*!
++   * \brief Make this pool's GL context current on the calling thread
++   *
++   * EGL contexts are current per thread, and the thread that creates this one
++   * is not the thread the game client runs on. Called from the game loop so
++   * the client's own GL calls have a context.
++   */
++  virtual void MakeContextCurrent() {}
+ };
+ } // namespace RETRO
+ } // namespace KODI
+diff --color -ruN a/cores/RetroPlayer/buffers/RenderBufferPoolFBO.cpp b/cores/RetroPlayer/buffers/RenderBufferPoolFBO.cpp
+--- a/xbmc/cores/RetroPlayer/buffers/RenderBufferPoolFBO.cpp
++++ b/xbmc/cores/RetroPlayer/buffers/RenderBufferPoolFBO.cpp
+@@ -68,6 +68,44 @@
+   m_active = true;
+ }
+ 
++void CRenderBufferPoolFBO::MakeContextCurrent()
++{
++  if (m_eglContext == EGL_NO_CONTEXT)
++    return;
++
++  // EGL contexts are current per thread, and this one was made current on the
++  // thread that created it - the client's SET_HW_RENDER, which is not the game
++  // loop. A client that renders from the game loop therefore has no context at
++  // all: every GL call it makes draws nothing, it never signals a finished
++  // frame, and the emulated CPU spins waiting for one.
++  const EGLContext current = eglGetCurrentContext();
++  if (current == m_eglContext)
++    return;
++
++  // Leave a thread that already has one alone. Clients differ in how they
++  // render: Mupen64Plus-Next draws on the thread the game loop calls it from
++  // and needs this, but PPSSPP runs a GL render thread of its own and makes a
++  // context current there. Taking it from such a client cannot work anyway - a
++  // context cannot be current on two threads at once - and the attempt failed
++  // once per frame:
++  //
++  //   RetroPlayer[RENDER]: Failed to make context current on the game loop
++  //   RetroPlayer[RENDER]: Framebuffer incomplete, status 0x0
++  if (current != EGL_NO_CONTEXT)
++    return;
++
++  if (!eglMakeCurrent(m_eglDisplay, EGL_NO_SURFACE, EGL_NO_SURFACE, m_eglContext))
++  {
++    // Once: this sits on the per-frame path.
++    static bool logged = false;
++    if (!logged)
++    {
++      logged = true;
++      CLog::Log(LOGERROR, "RetroPlayer[RENDER]: Failed to make context current on the game loop");
++    }
++  }
++}
++
+ IRenderBuffer* CRenderBufferPoolFBO::CreateRenderBuffer(void* header /* = nullptr */)
+ {
+   if (m_eglContext == EGL_NO_CONTEXT)
+--- a/xbmc/cores/RetroPlayer/buffers/RenderBufferPoolFBO.h	2026-09-07 14:37:17.480473818 +1200
++++ b/xbmc/cores/RetroPlayer/buffers/RenderBufferPoolFBO.h	2026-09-07 14:37:17.498095224 +1200
+@@ -44,6 +44,7 @@
+   void DestroyContext() override;
+   void EnableHardwareRendering(bool depth, bool stencil) override;
+   bool IsHardwareRendering() const override { return m_active; }
++  void MakeContextCurrent() override;
+ 
+   // implementation of CBaseRenderBufferPool
+   IRenderBuffer* CreateRenderBuffer(void* header = nullptr) override;
+diff --color -ruN a/cores/RetroPlayer/rendering/RPRenderManager.cpp b/cores/RetroPlayer/rendering/RPRenderManager.cpp
+--- a/xbmc/cores/RetroPlayer/rendering/RPRenderManager.cpp	2026-09-07 14:37:17.488953568 +1200
++++ b/xbmc/cores/RetroPlayer/rendering/RPRenderManager.cpp	2026-09-07 14:37:17.498202415 +1200
+@@ -383,6 +383,13 @@
+   if (m_hwRenderBuffer == nullptr)
+     return 0;
+ 
++  // Bind the pool's context to whichever thread is asking. The client asks from
++  // the game loop, and the context was made current on the thread that created
++  // it, so this is the only point at which the two meet. Cheap and idempotent -
++  // it returns immediately when the context is already the current one.
++  for (IRenderBufferPool* bufferPool : m_hwBufferPools)
++    bufferPool->MakeContextCurrent();
++
+   return m_hwRenderBuffer->GetCurrentFramebuffer();
+ }
+ 

@@ -1,0 +1,33 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: marty <marty@fyai.co.nz>
+Date: Sun, 7 Sep 2026 16:30:00 +1200
+Subject: [PATCH] Tell Kodi the hardware framebuffer size
+
+The software path already passes its geometry when it opens a stream; the
+hardware path passed nothing, so Kodi guessed 640x480 and clipped anything
+wider.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+---
+diff --git a/src/video/VideoStream.cpp b/src/video/VideoStream.cpp
+--- a/src/video/VideoStream.cpp
++++ b/src/video/VideoStream.cpp
+@@ -209,6 +209,18 @@
+   if (!m_stream.IsOpen() && m_streamType == GAME_STREAM_HW_FRAMEBUFFER)
+   {
+     game_stream_properties streamProperties{GAME_STREAM_HW_FRAMEBUFFER};
++
++    // Tell Kodi how big a framebuffer to allocate. Without this it has nothing
++    // to go on and falls back to 640x480, which clips anything wider - PPSSPP
++    // renders 864x272. SetGeometry() closes the stream, so a client that
++    // changes resolution reopens with the new size.
++    streamProperties.hw_framebuffer.nominal_width = m_geometry->NominalWidth();
++    streamProperties.hw_framebuffer.nominal_height = m_geometry->NominalHeight();
++    streamProperties.hw_framebuffer.nominal_display_aspect_ratio =
++        m_geometry->DisplayAspectRatio();
++    streamProperties.hw_framebuffer.max_width = m_geometry->MaxWidth();
++    streamProperties.hw_framebuffer.max_height = m_geometry->MaxHeight();
++
+     if (!m_stream.Open(streamProperties))
+     {
+       // This will stop the stream from trying to be opened twice

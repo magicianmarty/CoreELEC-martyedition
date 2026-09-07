@@ -1,0 +1,96 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: marty <marty@fyai.co.nz>
+Date: Sun, 7 Sep 2026 12:40:00 +1200
+Subject: [PATCH] Games: dispatch the hardware context reset from GetBuffer()
+
+Patch 1030 moved the reset out of OpenStream() and into RunFrame(). That fixed
+the framebuffer being reported as 0, and replaced a black screen with a
+segfault.
+
+Mupen64Plus-Next connects its video plugin from inside context_reset:
+context_reset() -> reinit_gfx_plugin() -> emu_step_initialize() ->
+plugin_connect_all(), which is what assigns `gfx = gfx_gln64`. Its retro_run()
+then runs the emulator with no guard, so main_run() reaches `if (!gfx.romOpen())`
+with the whole function table still zeroed and calls through a null pointer:
+
+    #0  0x0000000000000000
+    #1  game.libretro.mupen64plus-nx.so
+    #3  retro_run ()
+
+The reset has to happen before the client's first frame, and RunFrame() is too
+late by one frame: the client opens its stream from *inside* that first
+retro_run - glsm_ctl(GLSM_CTL_STATE_BIND) precedes co_switch() to the emulator
+thread - so the flag RunFrame() reads is not set until after the frame it would
+have dispatched in. The log shows the two, half a millisecond apart and on one
+thread:
+
+    RetroPlayer[RENDERING]: Render manager configured
+    mupen64plus: [EmuThread] M64CMD_EXECUTE
+
+Dispatching it where 1030 originally did does not work either, and that is the
+whole reason 1030 exists: OpenStream() runs inside the add-on's CStream::Open(),
+which assigns m_handle from that call's *return value*, so every callback the
+add-on makes during it is refused by its own `if (!m_handle) return false`.
+
+GetBuffer() is the one point where both hold. It is reached from
+GLSM_CTL_STATE_BIND, so CStream::Open() has returned and the handle is live,
+and it is still ahead of co_switch() and therefore ahead of romOpen(). The
+dispatch clears its own flag before calling out, so the get_current_framebuffer()
+the reset itself provokes re-enters here harmlessly.
+
+RunFrame() keeps its call as a fallback for a client that never asks for a
+buffer.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+---
+ xbmc/games/addons/streams/GameClientStreamHwFramebuffer.cpp | 8 ++++++++
+ xbmc/games/addons/streams/GameClientStreamHwFramebuffer.h   | 9 +++++++++
+ 2 files changed, 17 insertions(+)
+
+diff --git a/xbmc/games/addons/streams/GameClientStreamHwFramebuffer.cpp b/xbmc/games/addons/streams/GameClientStreamHwFramebuffer.cpp
+--- a/xbmc/games/addons/streams/GameClientStreamHwFramebuffer.cpp
++++ b/xbmc/games/addons/streams/GameClientStreamHwFramebuffer.cpp
+@@ -69,6 +69,24 @@
+                                   static_cast<RETRO::StreamBuffer&>(hwFramebufferBuffer)))
+     {
+       buffer.hw_framebuffer.framebuffer = hwFramebufferBuffer.framebuffer;
++
++      // Deliver the context reset here, and not before the lookup above.
++      //
++      // It cannot be delivered where it is requested, in OpenStream(): that
++      // runs inside the add-on's CStream::Open(), which assigns its handle from
++      // that call's return value, so the add-on refuses every callback made
++      // during it. Kodi holds the request until a buffer is asked for, which is
++      // the first point the handle is live.
++      //
++      // After the lookup rather than before it, because the lookup is what
++      // makes the pool's GL context current on this thread. A client sets its
++      // renderer up inside context_reset, so a reset delivered ahead of that
++      // runs every one of its GL calls against no current context.
++      //
++      // The flag is cleared before the reset is delivered, so the
++      // get_current_framebuffer() the reset provokes re-enters here harmlessly.
++      m_callback.DispatchPendingHardwareContextReset();
++
+       return true;
+     }
+   }
+diff --git a/xbmc/games/addons/streams/GameClientStreamHwFramebuffer.h b/xbmc/games/addons/streams/GameClientStreamHwFramebuffer.h
+--- a/xbmc/games/addons/streams/GameClientStreamHwFramebuffer.h
++++ b/xbmc/games/addons/streams/GameClientStreamHwFramebuffer.h
+@@ -35,6 +35,15 @@
+    * Any GL state is lost, and must not be deinitialized explicitly.
+    */
+   virtual void HardwareContextReset() = 0;
++
++  /*!
++   * \brief Deliver a context reset that was requested while the add-on was
++   *        still opening its stream
++   *
++   * Does nothing if none is pending. Safe to call re-entrantly: the pending
++   * flag is cleared before the reset is delivered.
++   */
++  virtual void DispatchPendingHardwareContextReset() = 0;
+ };
+ 
+ class CGameClientStreamHwFramebuffer : public IGameClientStream

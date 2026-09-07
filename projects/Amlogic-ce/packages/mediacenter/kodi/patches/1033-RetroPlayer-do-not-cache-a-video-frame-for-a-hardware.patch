@@ -1,0 +1,33 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: marty <marty@fyai.co.nz>
+Date: Sun, 7 Sep 2026 15:05:00 +1200
+Subject: [PATCH] RetroPlayer: do not cache a video frame for a hardware client
+
+Closing a hardware-rendered game segfaulted Kodi on the way out, in the
+savestate the player writes as it closes.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+---
+--- a/xbmc/cores/RetroPlayer/rendering/RPRenderManager.cpp	2026-09-07 15:01:46.804667953 +1200
++++ b/xbmc/cores/RetroPlayer/rendering/RPRenderManager.cpp	2026-09-07 15:01:46.816494459 +1200
+@@ -1023,6 +1023,20 @@
+ 
+ void CRPRenderManager::CacheVideoFrame(const std::string& savestatePath)
+ {
++  // Nothing to cache for a hardware-rendering client, and trying crashes.
++  //
++  // The frame lives in a framebuffer object on the GPU, not in a buffer with
++  // pixels a savestate thumbnail could be made from without a readback. The
++  // buffers here are also the pool's, and by the time CloseFile() asks for a
++  // savestate they have been released - so this walked freed memory and
++  // segfaulted on the way out of every hardware-rendered game:
++  //
++  //   CRPRenderManager::CacheVideoFrame
++  //   CReversiblePlayback::CreateSavestate
++  //   CRetroPlayer::CloseFile
++  if (!m_hwBufferPools.empty())
++    return;
++
+   std::unique_lock lock(m_bufferMutex);
+ 
+   // Get the render buffers for this savestate path

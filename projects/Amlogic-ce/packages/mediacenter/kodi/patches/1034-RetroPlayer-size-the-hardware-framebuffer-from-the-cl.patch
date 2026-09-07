@@ -1,0 +1,174 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: marty <marty@fyai.co.nz>
+Date: Sun, 7 Sep 2026 16:30:00 +1200
+Subject: [PATCH] RetroPlayer: size the hardware framebuffer from the client
+
+A hardware client draws into a framebuffer we allocate, and nothing told us how
+big it needed to be, so CRetroPlayerRendering::OpenStream() used 640x480 with a
+comment saying the client passes the real size to GetStreamBuffer() every
+frame. It does not - the wrapper asks with GetBuffer(0, 0), because a hardware
+client renders into whatever it is handed, which is what patch 1027 is about.
+
+640x480 is right for a 4:3 console and wrong for everything else. PPSSPP
+renders 864x272 and it landed in one corner of the buffer, clipped.
+
+game_stream_hw_framebuffer_properties was an empty struct, so the geometry had
+nowhere to travel. It shares a union with game_stream_video_properties, which
+already carries these five fields, so growing it changes no sizes and no other
+stream type. The client reopens its stream whenever its geometry changes, so
+what arrives here stays in step with what it draws.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+---
+--- a/xbmc/addons/kodi-dev-kit/include/kodi/c-api/addon-instance/game.h	2026-09-07 16:27:35.884886662 +1200
++++ b/xbmc/addons/kodi-dev-kit/include/kodi/c-api/addon-instance/game.h	2026-09-07 16:27:35.915339202 +1200
+@@ -396,7 +396,18 @@
+   ///
+   typedef struct game_stream_hw_framebuffer_properties
+   {
+-    char dummy; // Occupier for empty struct
++    /// @brief The size the client renders at, and the size of the largest
++    /// frame it will produce
++    ///
++    /// A hardware client draws into a framebuffer the frontend allocates, so
++    /// unless it says how big that has to be the frontend can only guess. It
++    /// used to guess 640x480, which is wrong for anything that is not a
++    /// 4:3 console - PPSSPP renders 864x272 and landed in one corner of it.
++    unsigned int nominal_width;
++    unsigned int nominal_height;
++    float nominal_display_aspect_ratio;
++    unsigned int max_width;
++    unsigned int max_height;
+   } ATTR_PACKED game_stream_hw_framebuffer_properties;
+   //----------------------------------------------------------------------------
+ 
+--- a/xbmc/cores/RetroPlayer/streams/RetroPlayerRendering.cpp	2026-09-07 16:27:35.894102615 +1200
++++ b/xbmc/cores/RetroPlayer/streams/RetroPlayerRendering.cpp	2026-09-07 16:27:35.915409026 +1200
+@@ -8,6 +8,8 @@
+ 
+ #include "RetroPlayerRendering.h"
+ 
++#include <algorithm>
++
+ #include "cores/RetroPlayer/process/RPProcessInfo.h"
+ #include "cores/RetroPlayer/rendering/RPRenderManager.h"
+ #include "cores/RetroPlayer/rendering/RenderTranslator.h"
+@@ -41,9 +43,22 @@
+   // to agree on. Dimensions are nominal: the client passes the real ones to
+   // GetStreamBuffer() every frame, and the buffer pool allocates per size.
+   const AVPixelFormat pixelFormat = AV_PIX_FMT_NONE;
+-  const unsigned int width = 640;
+-  const unsigned int height = 480;
+-  const float displayAspectRatio = 0.0f; // 0.0f means square pixels
++
++  // The size the client says it renders at, not a guess.
++  //
++  // This was hardcoded to 640x480, with a comment that the client passes the
++  // real size to GetStreamBuffer() every frame. It does not: the wrapper asks
++  // with GetBuffer(0, 0), because a hardware client renders into whatever it
++  // is handed. 640x480 is right for a 4:3 console and wrong for everything
++  // else - PPSSPP renders 864x272, which landed in one corner of the buffer.
++  //
++  // The client reopens its stream whenever its geometry changes, so this stays
++  // in step with it.
++  const unsigned int width = hwProperties.nominalWidth > 0 ? hwProperties.nominalWidth : 640;
++  const unsigned int height = hwProperties.nominalHeight > 0 ? hwProperties.nominalHeight : 480;
++  const unsigned int maxWidth = std::max(hwProperties.maxWidth, width);
++  const unsigned int maxHeight = std::max(hwProperties.maxHeight, height);
++  const float displayAspectRatio = hwProperties.displayAspectRatio; // 0.0f means square pixels
+ 
+   CLog::Log(LOGDEBUG, "RetroPlayer[RENDERING]: Creating rendering stream - width {}, height {}",
+             width, height);
+@@ -63,7 +78,8 @@
+   if (!m_renderManager.Create(width, height, hwProperties.depth, hwProperties.stencil))
+     return false;
+ 
+-  if (!m_renderManager.Configure(pixelFormat, width, height, displayAspectRatio, width, height))
++  if (!m_renderManager.Configure(pixelFormat, width, height, displayAspectRatio, maxWidth,
++                                 maxHeight))
+     return false;
+ 
+   CLog::Log(LOGDEBUG, "RetroPlayer[RENDERING]: Render manager configured");
+--- a/xbmc/cores/RetroPlayer/streams/RetroPlayerRendering.h	2026-09-07 16:27:35.889910232 +1200
++++ b/xbmc/cores/RetroPlayer/streams/RetroPlayerRendering.h	2026-09-07 16:27:35.915382666 +1200
+@@ -36,7 +36,12 @@
+                           unsigned int versionMajor,
+                           unsigned int versionMinor,
+                           bool cacheContext,
+-                          bool debugContext)
++                          bool debugContext,
++                          unsigned int nominalWidth,
++                          unsigned int nominalHeight,
++                          float displayAspectRatio,
++                          unsigned int maxWidth,
++                          unsigned int maxHeight)
+     : contextType(contextType),
+       depth(depth),
+       stencil(stencil),
+@@ -44,7 +49,12 @@
+       versionMajor(versionMajor),
+       versionMinor(versionMinor),
+       cacheContext(cacheContext),
+-      debugContext(debugContext)
++      debugContext(debugContext),
++      nominalWidth(nominalWidth),
++      nominalHeight(nominalHeight),
++      displayAspectRatio(displayAspectRatio),
++      maxWidth(maxWidth),
++      maxHeight(maxHeight)
+   {
+   }
+ 
+@@ -56,6 +66,11 @@
+   unsigned int versionMinor;
+   bool cacheContext;
+   bool debugContext;
++  unsigned int nominalWidth;
++  unsigned int nominalHeight;
++  float displayAspectRatio;
++  unsigned int maxWidth;
++  unsigned int maxHeight;
+ };
+ 
+ struct HwFramebufferBuffer : public StreamBuffer
+--- a/xbmc/games/addons/streams/GameClientStreamHwFramebuffer.cpp	2026-09-07 16:27:35.898073327 +1200
++++ b/xbmc/games/addons/streams/GameClientStreamHwFramebuffer.cpp	2026-09-07 16:27:35.915429078 +1200
+@@ -35,7 +35,7 @@
+   }
+ 
+   std::unique_ptr<RETRO::HwFramebufferProperties> hwProperties =
+-      TranslateProperties(*m_hwProperties);
++      TranslateProperties(*m_hwProperties, properties.hw_framebuffer);
+ 
+   if (stream->OpenStream(*hwProperties))
+   {
+@@ -157,10 +157,15 @@
+ }
+ 
+ std::unique_ptr<RETRO::HwFramebufferProperties> CGameClientStreamHwFramebuffer::TranslateProperties(
+-    const game_hw_rendering_properties& hwProperties)
++    const game_hw_rendering_properties& hwProperties,
++    const game_stream_hw_framebuffer_properties& streamProperties)
+ {
++  // The context properties come from SET_HW_RENDER, which says nothing about
++  // size; the geometry comes from the stream the client opened.
+   return std::make_unique<RETRO::HwFramebufferProperties>(
+       hwProperties.context_type, hwProperties.depth, hwProperties.stencil,
+       hwProperties.bottom_left_origin, hwProperties.version_major, hwProperties.version_minor,
+-      hwProperties.cache_context, hwProperties.debug_context);
++      hwProperties.cache_context, hwProperties.debug_context, streamProperties.nominal_width,
++      streamProperties.nominal_height, streamProperties.nominal_display_aspect_ratio,
++      streamProperties.max_width, streamProperties.max_height);
+ }
+--- a/xbmc/games/addons/streams/GameClientStreamHwFramebuffer.h	2026-09-07 16:27:35.902476940 +1200
++++ b/xbmc/games/addons/streams/GameClientStreamHwFramebuffer.h	2026-09-07 16:30:08.553875324 +1200
+@@ -69,7 +69,8 @@
+                                     unsigned int versionMajor,
+                                     unsigned int versionMinor);
+   static std::unique_ptr<RETRO::HwFramebufferProperties> TranslateProperties(
+-      const game_hw_rendering_properties& hwProperties);
++      const game_hw_rendering_properties& hwProperties,
++      const game_stream_hw_framebuffer_properties& streamProperties);
+ 
+   // Construction parameters
+   IHwFramebufferCallback& m_callback;

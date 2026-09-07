@@ -54,13 +54,35 @@ why a plain rebuild retires the hand-built ABI-6 `game.libretro` wrapper.
 
 ## Building
 
+**Build in the container.** `scripts-marty/` already wraps this:
+
 ```sh
-PROJECT=Amlogic-ce DEVICE=Amlogic-no ARCH=aarch64 make image
+./scripts-marty/build-in-container.sh       # the whole image
+./scripts-marty/build-package.sh kodi       # one package, for patch iteration
 ```
 
-Those values are not a guess — they are what the running box reports in
-`/etc/os-release` (`DISTRO_PROJECT`, `DISTRO_DEVICE`). Building
-`Amlogic/AMLGX` instead produces an image for different hardware.
+Not merely because `scripts/checkdeps` wants packages installed as root -
+**a host build actively damages the tree.** The toolchain wrappers under
+`build.*/toolchain/bin` have `/work` baked in as an absolute path, so the build
+dies at the first `host-gcc` call with
+
+    /work/.../ccache: No such file or directory
+
+and on the way down leaves files in the build tree labelled `user_tmp_t`, moved
+in from the host's `/tmp`. The container then cannot unlink its own package
+cache:
+
+    mv: unable to remove target: Permission denied
+
+The `:z` on the volume mount is what keeps that recoverable - it relabels the
+tree shared on every run. A mount without it gets per-container SELinux MCS
+categories, and then each build is unable to delete what the last one wrote.
+
+The environment those scripts set is not a guess: `PROJECT=Amlogic-ce`,
+`DEVICE=Amlogic-no`, `ARCH=aarch64` are what the running box reports in
+`/etc/os-release`. Building `Amlogic/AMLGX` instead produces an image for
+different hardware. `JOBS` is capped at 12 on purpose; see the binutils note in
+`scripts-marty/build-in-container.sh`.
 
 Output is a `.tar` under `target/`, installed by dropping it in
 `/storage/.update/` and rebooting. That is CoreELEC's supported update path;

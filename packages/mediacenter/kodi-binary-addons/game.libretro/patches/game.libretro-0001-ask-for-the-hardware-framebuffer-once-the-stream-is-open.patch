@@ -1,0 +1,118 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: marty <marty@fyai.co.nz>
+Date: Sun, 7 Sep 2026 12:45:00 +1200
+Subject: [PATCH] Make hardware rendering get a real framebuffer, every frame
+
+A hardware-rendering client never gets its context reset in time, and on
+Mupen64Plus-Next that is fatal rather than cosmetic: the core connects its
+video plugin from inside context_reset (reinit_gfx_plugin ->
+emu_step_initialize -> plugin_connect_all, which assigns gfx = gfx_gln64), and
+its retro_run() switches to the emulator thread with no guard. main_run() then
+reaches `if (!gfx.romOpen())` with the function table still zeroed and calls
+through a null pointer.
+
+The reset cannot be delivered while OpenStream() is running, because CStream
+assigns m_handle from that call's *return value* - so GetHwFramebuffer() below
+takes its !IsOpen() early return and answers 0, and libretro's GL state manager
+caches that answer for the session in glsm_state_setup(). Kodi therefore holds
+the request until the handle is live. But nothing asks for a buffer between
+this Open() and the client running, so the request sat unclaimed and the client
+ran uninitialised:
+
+    RetroPlayer[RENDERING]: Render manager configured
+    mupen64plus: [EmuThread] M64CMD_EXECUTE      <- 0.5ms later, same thread
+
+Asking here is what claims it. Open() has returned, so m_handle is set and the
+call reaches Kodi, which delivers the pending reset before answering - and this
+is still OnFrameBegin(), ahead of the client's frame and therefore ahead of
+romOpen(). The framebuffer is cached in m_framebuffer either way, so the frame
+that follows uses it rather than fetching it twice.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+---
+ src/video/VideoStream.cpp | 9 +++++++++
+ 1 file changed, 9 insertions(+)
+
+Two things stop it. Kodi's software and hardware streams disagree about
+game_stream_buffer::type: GetBuffer() on the software side sets it as an output
+and never inspects what came in, while the hardware side requires it as an
+input and returns false unless it already reads GAME_STREAM_HW_FRAMEBUFFER.
+This asked with a zero-initialised buffer, which is GAME_STREAM_UNKNOWN, so the
+request was refused before it reached the stream and GetHwFramebuffer() could
+only ever answer 0.
+
+And nothing asked at all before the client's first frame. Kodi holds the
+hardware context reset until the add-on's stream handle is live - it cannot be
+delivered during OpenStream(), because CStream assigns m_handle from that
+call's return value - and it hands it over on the first buffer request. With no
+such request the reset stayed unclaimed and the client ran uninitialised. On
+Mupen64Plus-Next that is fatal rather than cosmetic: the core connects its
+video plugin from inside context_reset, and main_run() then reaches
+`if (!gfx.romOpen())` with the function table still zeroed and calls through a
+null pointer.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+---
+ src/video/VideoStream.cpp | 17 +++++++++++++++++
+ 1 file changed, 17 insertions(+)
+
+diff --git a/src/video/VideoStream.cpp b/src/video/VideoStream.cpp
+--- a/src/video/VideoStream.cpp
++++ b/src/video/VideoStream.cpp
+@@ -63,10 +63,30 @@
+ 
+   if (!m_framebuffer)
+   {
+-    m_framebuffer.reset(new game_stream_buffer{});
++    // Filled in locally and only published once it holds a real answer.
++    //
++    // Requesting a buffer is re-entrant: Kodi delivers the pending hardware
++    // context reset from inside GetBuffer(), and the client asks for its
++    // framebuffer from inside that reset. Assigning m_framebuffer up front and
++    // filling it in place left that inner call looking at an allocated but
++    // still-zeroed buffer, so it was told 0 - and libretro's GL state manager
++    // asks exactly once, in glsm_state_setup(), and caches the answer for the
++    // session. The client then renders to the default framebuffer forever,
++    // which on a surfaceless context is nowhere.
++    std::unique_ptr<game_stream_buffer> buffer(new game_stream_buffer{});
++
++    // Kodi's two stream types disagree about what this field means. The
++    // software GetBuffer() sets it as an output and never inspects the input;
++    // the hardware one requires it as an input and refuses anything that is
++    // not already GAME_STREAM_HW_FRAMEBUFFER. Zeroed is GAME_STREAM_UNKNOWN.
++    buffer->type = GAME_STREAM_HW_FRAMEBUFFER;
+ 
+-    if (!m_stream.GetBuffer(0, 0, *m_framebuffer))
++    if (!m_stream.GetBuffer(0, 0, *buffer))
+       return 0;
++
++    // The inner call may have published one already; either is correct.
++    if (!m_framebuffer)
++      m_framebuffer = std::move(buffer);
+   }
+ 
+   return m_framebuffer->hw_framebuffer.framebuffer;
+@@ -215,6 +235,23 @@
+       m_streamType = GAME_STREAM_UNKNOWN;
+     }
+   }
++
++  // Take this frame's buffer up front, every frame.
++  //
++  // On the first frame this also claims the hardware context reset Kodi is
++  // holding. It cannot be delivered during Open(), because CStream assigns
++  // m_handle from that call's return value and refuses callbacks until it
++  // returns, so Kodi hands it over on the first buffer request instead. With
++  // nothing asking, the reset stayed unclaimed and the client ran
++  // uninitialised.
++  //
++  // Every frame after that is what keeps a picture on screen: OnFrameEnd()
++  // releases the buffer and drops it, and RenderHwFrame() submits nothing
++  // without one. Upstream relies on the client re-asking through
++  // get_current_framebuffer() each frame, which a client using libretro's GL
++  // state manager never does - it asks once and caches.
++  if (m_streamType == GAME_STREAM_HW_FRAMEBUFFER && m_stream.IsOpen())
++    GetHwFramebuffer();
+ }
+ 
+ void CVideoStream::OnFrameEnd()

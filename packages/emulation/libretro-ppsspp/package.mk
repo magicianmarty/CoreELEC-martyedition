@@ -37,6 +37,26 @@ if [ "${OPENGLES_SUPPORT}" = "yes" ]; then
   PKG_CMAKE_OPTS_TARGET+=" -DUSING_GLES2=ON -DUSING_EGL=ON"
 fi
 
+# Without this the core loads and then dies the moment it runs a game:
+#
+#   kodi.bin: symbol lookup error: game.libretro.ppsspp.so:
+#             undefined symbol: __aarch64_cas8_acq_rel
+#
+# GCC's -moutline-atomics (on by default for aarch64) turns atomics into calls
+# to __aarch64_cas*/__aarch64_ldadd* helpers, which live in the static libgcc.a
+# and not in the libgcc_s.so.1 on the box. They bind lazily, so the core links,
+# loads, boots the game's EBOOT and initialises the kernel before the first
+# atomic in the emulation loop kills the whole of Kodi with exit 127. None of
+# the other cores here reference them.
+# The references are not in PPSSPP's own code - they are in the prebuilt
+# ffmpeg static libraries it ships in ffmpeg/linux/aarch64/lib, which were
+# compiled elsewhere with outline atomics - so no compiler flag on this build
+# can remove them. libgcc.a defines both; libgcc_s.so.1 does not, and the
+# linker prefers the shared one and is happy to leave the symbols undefined
+# because that is legal in a shared object. Forcing the static libgcc resolves
+# them at link time instead of failing at the first atomic at run time.
+TARGET_LDFLAGS+=" -static-libgcc"
+
 makeinstall_target() {
   mkdir -p ${SYSROOT_PREFIX}/usr/lib/cmake/${PKG_NAME}
   cp ${PKG_LIBPATH} ${SYSROOT_PREFIX}/usr/lib/${PKG_LIBNAME}
