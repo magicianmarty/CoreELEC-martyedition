@@ -1,0 +1,266 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: marty <marty@fyai.co.nz>
+Date: Sun, 7 Sep 2026 18:15:00 +1200
+Subject: [PATCH] RetroPlayer: run-ahead
+
+Shows the client further ahead than it has actually got to, so that input
+appears to take effect sooner. RetroArch's feature, and the single biggest
+difference in how a game feels to play.
+
+The client is run once for the frame the emulation genuinely advances to, then
+again for each frame of run-ahead. Restoring the state saved after the first
+run puts the emulation back where it belongs, so it still moves one frame per
+tick, but what is seen and heard is that many frames further on.
+
+Audio is taken from the last run rather than the first: the same frames are
+re-run every tick, so it is the last ones that form a continuous stream.
+
+Off by default - it costs an extra run of the client per frame of run-ahead
+plus a savestate save and load, and a client that cannot serialise cannot do it
+at all. Enable in advancedsettings.xml:
+
+    <games><runaheadframes>1</runaheadframes></games>
+
+or per game, from whatever launches it, since what a client can afford varies
+game to game and advancedsettings.xml is read once at startup:
+
+    Window(Home).Property(retroplayer.runahead)
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+---
+--- a/xbmc/cores/RetroPlayer/playback/ReversiblePlayback.cpp
++++ b/xbmc/cores/RetroPlayer/playback/ReversiblePlayback.cpp
+@@ -8,6 +8,19 @@
+ 
+ #include "ReversiblePlayback.h"
+ 
++#include "cores/RetroPlayer/streams/RPStreamManager.h"
++#include "guilib/GUIComponent.h"
++#include "guilib/GUIWindow.h"
++#include "guilib/GUIWindowManager.h"
++#include "guilib/WindowIDs.h"
++#include "settings/AdvancedSettings.h"
++#include "settings/SettingsComponent.h"
++#include "utils/Variant.h"
++
++#include <algorithm>
++#include <cstdlib>
++#include <string>
++
+ #include "ServiceBroker.h"
+ #include "XBDateTime.h"
+ #include "addons/AddonVersion.h"
+@@ -36,17 +49,47 @@
+ 
+ #define REWIND_FACTOR 0.25 // Rewind at 25% of gameplay speed
+ 
++namespace
++{
++constexpr int MAX_RUNAHEAD_FRAMES = 4;
++
++unsigned int GetRunAheadFrames()
++{
++  int frames =
++      CServiceBroker::GetSettingsComponent()->GetAdvancedSettings()->m_gamesRunAheadFrames;
++
++  // How far ahead to run is a property of the game, not of the installation:
++  // a heavy client cannot afford what a light one can. advancedsettings.xml is
++  // parsed once at startup, so on its own it can only carry one value for all
++  // of them; a home-window property lets the add-on launching a game say what
++  // that game can take.
++  const CGUIWindow* home = CServiceBroker::GetGUI()->GetWindowManager().GetWindow(WINDOW_HOME);
++  if (home != nullptr)
++  {
++    const std::string runAhead = home->GetProperty("retroplayer.runahead").asString();
++    if (!runAhead.empty())
++      frames = std::atoi(runAhead.c_str());
++  }
++
++  return static_cast<unsigned int>(std::clamp(frames, 0, MAX_RUNAHEAD_FRAMES));
++}
++} // namespace
++
+ CReversiblePlayback::CReversiblePlayback(GAME::CGameClient* gameClient,
+                                          CRPRenderManager& renderManager,
+                                          CGUIGameMessenger& guiMessenger,
+                                          double fps,
+-                                         size_t serializeSize)
++                                         size_t serializeSize,
++                                         CRPStreamManager* streamManager)
+   : m_gameClient(gameClient),
+     m_renderManager(renderManager),
++    m_streamManager(streamManager),
+     m_guiMessenger(guiMessenger),
+     m_gameLoop(this, fps),
+     m_savestateDatabase(new CSavestateDatabase)
+ {
++  m_runAheadFrames = GetRunAheadFrames();
++
+   UpdateMemoryStream();
+ 
+   GAME::CGameSettings& gameSettings = CServiceBroker::GetGameServices().GameSettings();
+@@ -355,12 +398,73 @@
+ 
+ void CReversiblePlayback::FrameEvent()
+ {
+-  m_gameClient->RunFrame();
++  if (m_runAheadFrames > 0)
++    RunAheadFrame();
++  else
++    m_gameClient->RunFrame();
++
+   UpdateFrameRate();
+ 
+   AddFrame();
+ }
+ 
++void CReversiblePlayback::RunAheadFrame()
++{
++  // Show the client further ahead than it has actually got to.
++  //
++  // The client is run once for the frame the emulation genuinely advances to,
++  // and then again for each frame of run-ahead; only the last of those is
++  // heard, and it is the one left on screen. Restoring the state saved after
++  // the first run puts the emulation back where it belongs, so it still moves
++  // one frame per tick - but what the player sees and hears is that many
++  // frames further on, and their input appears to take effect that much
++  // sooner.
++  //
++  // Audio has to come from the last run rather than the first: the same frames
++  // are re-run every tick, so it is the last ones that form a continuous
++  // stream. Video needs no such care - the client simply draws over its
++  // previous output and the final frame is the one that stands.
++  const size_t serializeSize = m_gameClient->GetSerializeSize();
++  if (serializeSize == 0 || m_streamManager == nullptr)
++  {
++    // A client that cannot serialise cannot do this. Say so once and carry on
++    // normally rather than paying the cost for no benefit.
++    CLog::Log(LOGWARNING, "RetroPlayer[RUNAHEAD]: Client cannot save state, running ahead disabled");
++    m_runAheadFrames = 0;
++    m_gameClient->RunFrame();
++    return;
++  }
++
++  if (m_runAheadState.size() != serializeSize)
++    m_runAheadState.resize(serializeSize);
++
++  m_streamManager->EnableAudio(false);
++
++  m_gameClient->RunFrame();
++
++  if (!m_gameClient->Serialize(m_runAheadState.data(), serializeSize))
++  {
++    CLog::Log(LOGWARNING, "RetroPlayer[RUNAHEAD]: Failed to save state, running ahead disabled");
++    m_runAheadFrames = 0;
++    m_streamManager->EnableAudio(true);
++    return;
++  }
++
++  for (unsigned int frame = 1; frame <= m_runAheadFrames; ++frame)
++  {
++    if (frame == m_runAheadFrames)
++      m_streamManager->EnableAudio(true);
++
++    m_gameClient->RunFrame();
++  }
++
++  if (!m_gameClient->Deserialize(m_runAheadState.data(), serializeSize))
++  {
++    CLog::Log(LOGERROR, "RetroPlayer[RUNAHEAD]: Failed to restore state, running ahead disabled");
++    m_runAheadFrames = 0;
++  }
++}
++
+ void CReversiblePlayback::RewindEvent()
+ {
+   RewindFrames(1);
+--- a/xbmc/cores/RetroPlayer/playback/ReversiblePlayback.h
++++ b/xbmc/cores/RetroPlayer/playback/ReversiblePlayback.h
+@@ -34,6 +34,8 @@
+ class CSavestateDatabase;
+ class IMemoryStream;
+ 
++class CRPStreamManager;
++
+ class CReversiblePlayback : public IPlayback, public IGameLoopCallback, public Observer
+ {
+ public:
+@@ -41,7 +43,8 @@
+                       CRPRenderManager& renderManager,
+                       CGUIGameMessenger& guiMessenger,
+                       double fps,
+-                      size_t serializeSize);
++                      size_t serializeSize,
++                      CRPStreamManager* streamManager);
+ 
+   ~CReversiblePlayback() override;
+ 
+@@ -81,8 +84,15 @@
+                        uint64_t timestampFrames);
+ 
+   // Construction parameter
++  void RunAheadFrame();
++
+   GAME::CGameClient* const m_gameClient;
+   CRPRenderManager& m_renderManager;
++  CRPStreamManager* const m_streamManager;
++
++  // Run-ahead
++  unsigned int m_runAheadFrames = 0;
++  std::vector<uint8_t> m_runAheadState;
+   CGUIGameMessenger& m_guiMessenger;
+ 
+   // Gameplay functionality
+--- a/xbmc/cores/RetroPlayer/RetroPlayer.cpp	2026-09-07 18:09:36.622988298 +1200
++++ b/xbmc/cores/RetroPlayer/RetroPlayer.cpp	2026-09-07 18:09:36.633112241 +1200
+@@ -661,7 +661,7 @@
+     m_playback->Deinitialize();
+     m_playback = std::make_unique<CReversiblePlayback>(
+         m_gameClient.get(), *m_renderManager, *m_guiMessenger, m_gameClient->GetFrameRate(),
+-        m_gameClient->GetSerializeSize());
++        m_gameClient->GetSerializeSize(), m_streamManager.get());
+   }
+   else
+     ResetPlayback();
+--- a/xbmc/settings/AdvancedSettings.cpp	2026-09-07 18:09:36.609415109 +1200
++++ b/xbmc/settings/AdvancedSettings.cpp	2026-09-07 18:09:36.632974947 +1200
+@@ -203,6 +203,7 @@
+   m_videoSubsDelayStep = 0.1f;
+   m_videoAudioDelayRange = 10;
+   m_videoAudioDelayStep = 0.025f;
++  m_gamesRunAheadFrames = 0;
+   m_videoUseTimeSeeking = true;
+   m_videoSmoothPercentToTimeSeeking = true;
+   m_videoTimeSeekForward = 30;
+@@ -681,6 +682,15 @@
+     XMLUtils::GetBoolean(pElement, "omlsync", m_omlSync);
+   }
+ 
++  pElement = pRootElement->FirstChildElement("games");
++  if (pElement)
++  {
++    // Beyond a couple of frames the cost outweighs the latency saved, and a
++    // client that cannot serialise cannot do this at all - see
++    // CReversiblePlayback::FrameEvent().
++    XMLUtils::GetInt(pElement, "runaheadframes", m_gamesRunAheadFrames, 0, 4);
++  }
++
+   pElement = pRootElement->FirstChildElement("video");
+   if (pElement)
+   {
+--- a/xbmc/settings/AdvancedSettings.h	2026-09-07 18:09:36.604515397 +1200
++++ b/xbmc/settings/AdvancedSettings.h	2026-09-07 18:09:36.632837276 +1200
+@@ -158,6 +158,13 @@
+     float m_videoSubsDelayStep;
+     float m_videoAudioDelayRange;
+     float m_videoAudioDelayStep;
++    /*! \brief Frames a game client is run ahead of what is shown.
++     Trades CPU for input latency: each frame costs one extra run of the
++     client per frame of run-ahead, plus a savestate save and load. Zero
++     disables it. Set in advancedsettings.xml as
++     <games><runaheadframes>1</runaheadframes></games>. */
++    int m_gamesRunAheadFrames;
++
+     bool m_videoUseTimeSeeking;
+     bool m_videoSmoothPercentToTimeSeeking;
+     int m_videoTimeSeekForward;

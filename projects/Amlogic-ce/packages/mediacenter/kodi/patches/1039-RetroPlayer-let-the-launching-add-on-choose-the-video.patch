@@ -1,0 +1,86 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: marty <marty@fyai.co.nz>
+Date: Sun, 7 Sep 2026 19:30:00 +1200
+Subject: [PATCH] RetroPlayer: let the launching add-on choose the video filter
+
+A shader preset and a stretch mode are per-game choices, but nothing outside
+the in-game OSD can make them. <defaultgamesettings> is a guisettings.xml
+section Kodi caches at startup and rewrites on exit, so an add-on that edits
+the file has its change either ignored or overwritten, and neither value is
+registered as a setting, so JSON-RPC cannot reach them either. The practical
+result is that every game starts with whatever the last one was left on.
+
+Read two home-window properties where the settings are seeded from the
+defaults, so the add-on that launches a game can say how that game should look:
+
+    retroplayer.videofilter   nearest | linear | <path to a .glslp preset>
+    retroplayer.stretchmode   normal | 4:3 | 16:9 | integer | fullscreen | ...
+
+An empty or absent property leaves the default alone, so this is inert unless
+something sets it.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+---
+--- a/xbmc/cores/RetroPlayer/guibridge/GUIGameSettings.cpp
++++ b/xbmc/cores/RetroPlayer/guibridge/GUIGameSettings.cpp
+@@ -8,11 +8,19 @@
+ 
+ #include "GUIGameSettings.h"
+ 
++#include "ServiceBroker.h"
++#include "cores/RetroPlayer/RetroPlayerUtils.h"
+ #include "cores/RetroPlayer/process/RPProcessInfo.h"
+ #include "cores/RetroPlayer/rendering/RenderContext.h"
++#include "guilib/GUIComponent.h"
++#include "guilib/GUIWindow.h"
++#include "guilib/GUIWindowManager.h"
++#include "guilib/WindowIDs.h"
+ #include "settings/GameSettings.h"
++#include "utils/Variant.h"
+ 
+ #include <mutex>
++#include <string>
+ 
+ using namespace KODI;
+ using namespace RETRO;
+@@ -24,6 +32,8 @@
+   // Reset game settings
+   m_guiSettings = m_processInfo.GetRenderContext().GetDefaultGameSettings();
+ 
++  ApplyLaunchOverrides();
++
+   UpdateSettings();
+ 
+   m_guiSettings.RegisterObserver(this);
+@@ -55,6 +65,21 @@
+   }
+ }
+ 
++void CGUIGameSettings::ApplyLaunchOverrides()
++{
++  CGUIWindow* home = CServiceBroker::GetGUI()->GetWindowManager().GetWindow(WINDOW_HOME);
++  if (home == nullptr)
++    return;
++
++  const std::string videoFilter = home->GetProperty("retroplayer.videofilter").asString();
++  if (!videoFilter.empty())
++    m_guiSettings.SetVideoFilter(videoFilter);
++
++  const std::string stretchMode = home->GetProperty("retroplayer.stretchmode").asString();
++  if (!stretchMode.empty())
++    m_guiSettings.SetStretchMode(CRetroPlayerUtils::IdentifierToStretchMode(stretchMode));
++}
++
+ void CGUIGameSettings::UpdateSettings()
+ {
+   std::unique_lock lock(m_mutex);
+--- a/xbmc/cores/RetroPlayer/guibridge/GUIGameSettings.h
++++ b/xbmc/cores/RetroPlayer/guibridge/GUIGameSettings.h
+@@ -36,6 +36,7 @@
+   void Notify(const Observable& obs, const ObservableMessage msg) override;
+ 
+ private:
++  void ApplyLaunchOverrides();
+   void UpdateSettings();
+ 
+   // Construction parameters

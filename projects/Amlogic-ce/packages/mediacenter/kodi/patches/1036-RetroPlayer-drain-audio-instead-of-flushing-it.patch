@@ -1,0 +1,58 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: marty <marty@fyai.co.nz>
+Date: Sun, 7 Sep 2026 17:45:00 +1200
+Subject: [PATCH] RetroPlayer: drain audio instead of flushing it
+
+The audio broke for a moment every so often, most noticeably while a game was
+loading. Kodi flushes the whole audio stream once the sink delay passes 300ms,
+and everything already queued goes with it - that is what is heard.
+
+The delay creeps past the threshold whenever a client stalls and then catches
+up, which a disc load does reliably, and it was only ever a few milliseconds
+over when it fired:
+
+    RetroPlayer[AUDIO]: Audio delay (306.12 ms) is too high - flushing
+    RetroPlayer[AUDIO]: Audio delay (306.03 ms) is too high - flushing
+
+Skipping the packet instead gives the sink one packet's worth of time to drain
+and brings the delay back under within a few frames, inaudibly. Flushing is
+kept for a delay far enough out that something is genuinely wrong.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+---
+--- a/xbmc/cores/RetroPlayer/streams/RetroPlayerAudio.cpp	2026-09-07 17:44:01.670932072 +1200
++++ b/xbmc/cores/RetroPlayer/streams/RetroPlayerAudio.cpp	2026-09-07 17:44:01.689962679 +1200
+@@ -25,6 +25,10 @@
+ 
+ const double MAX_DELAY = 0.3; // seconds
+ 
++// Only worth throwing the buffer away past this. Between MAX_DELAY and here
++// the excess is worked off a packet at a time instead - see AddStreamData().
++const double FLUSH_DELAY = 1.0; // seconds
++
+ // How long to stay quiet between log lines.
+ const std::chrono::seconds DROP_LOG_INTERVAL{10};
+ 
+@@ -124,6 +128,22 @@
+ 
+       if (delaySecs > MAX_DELAY)
+       {
++        // Work the excess off a packet at a time rather than flushing.
++        //
++        // Flushing drops everything already queued, which is heard as a break
++        // in the sound. The delay creeps past MAX_DELAY on its own whenever a
++        // client stalls and then catches up - a disc load is the usual cause -
++        // and it was only ever a few milliseconds over:
++        //
++        //   RetroPlayer[AUDIO]: Audio delay (306.12 ms) is too high - flushing
++        //
++        // Skipping this packet gives the sink one packet's worth of time to
++        // drain, which brings it back under in a handful of frames and is not
++        // audible. A flush is kept for a delay far enough out that something
++        // is genuinely wrong.
++        if (delaySecs <= FLUSH_DELAY)
++          return;
++
+         m_pAudioStream->Flush();
+         CLog::Log(LOGDEBUG, "RetroPlayer[AUDIO]: Audio delay ({:0.2f} ms) is too high - flushing",
+                   delaySecs * 1000);

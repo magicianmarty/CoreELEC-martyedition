@@ -1,0 +1,101 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: marty <marty@fyai.co.nz>
+Date: Sun, 7 Sep 2026 18:00:00 +1200
+Subject: [PATCH] RetroPlayer: dynamic rate control for game audio
+
+A client produces samples at its own fixed rate and the sink consumes them at
+the sound card's, and the two are never exactly equal, so the buffer drifts
+until something corrects it. Patch 1036 made the correction inaudible; this
+keeps it from being needed, which is what RetroArch does.
+
+The buffer is held near TARGET_DELAY by nudging the stream's resample ratio in
+proportion to how far off it is, clamped to 0.5% - far below an audible pitch
+change and enough to absorb the drift.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+---
+--- a/xbmc/cores/RetroPlayer/streams/RetroPlayerAudio.cpp	2026-09-07 18:07:02.462223338 +1200
++++ b/xbmc/cores/RetroPlayer/streams/RetroPlayerAudio.cpp	2026-09-07 18:07:02.478719023 +1200
+@@ -8,6 +8,9 @@
+ 
+ #include "RetroPlayerAudio.h"
+ 
++#include <algorithm>
++#include <cmath>
++
+ #include "ServiceBroker.h"
+ #include "cores/AudioEngine/Interfaces/AE.h"
+ #include "cores/AudioEngine/Interfaces/AEStream.h"
+@@ -29,6 +32,16 @@
+ // the excess is worked off a packet at a time instead - see AddStreamData().
+ const double FLUSH_DELAY = 1.0; // seconds
+ 
++// Dynamic rate control. The client produces samples at its own fixed rate and
++// the sink consumes them at the sound card's, and the two are never exactly
++// equal - so the buffer drifts one way or the other until something corrects
++// it. Correcting after the fact is audible however gently it is done; nudging
++// the resampler keeps the buffer where it should be so the correction never
++// has to happen.
++const double TARGET_DELAY = 0.15; // seconds, half of MAX_DELAY
++const double MAX_SKEW = 0.005; // 0.5%, well under audible pitch change
++const std::chrono::seconds RATE_LOG_INTERVAL{10};
++
+ // How long to stay quiet between log lines.
+ const std::chrono::seconds DROP_LOG_INTERVAL{10};
+ 
+@@ -104,6 +117,10 @@
+     return false;
+   }
+ 
++  // Dynamic resampling has to be on for SetResampleRatio() to do anything.
++  m_pAudioStream->SetResampleMode(1);
++  m_resampleRatio = 1.0;
++
+   m_processInfo.SetAudioChannels(audioFormat.m_channelLayout);
+   m_processInfo.SetAudioSampleRate(audioFormat.m_sampleRate);
+   m_processInfo.SetAudioBitsPerSample(CAEUtil::DataFormatToUsedBits(audioFormat.m_dataFormat));
+@@ -149,6 +166,31 @@
+                   delaySecs * 1000);
+       }
+ 
++      // Hold the buffer near TARGET_DELAY by nudging the resample ratio.
++      //
++      // A ratio above 1.0 produces more output samples per input sample, so
++      // the sink takes longer to work through them and the delay grows; below
++      // 1.0 it shrinks. The correction is proportional to how far off target
++      // the buffer is and clamped to MAX_SKEW, so in the steady state it sits
++      // a fraction of a percent either side of nominal.
++      const double error = (delaySecs - TARGET_DELAY) / TARGET_DELAY;
++      const double clamped = std::clamp(error, -1.0, 1.0);
++      const double ratio = 1.0 - clamped * MAX_SKEW;
++
++      if (std::abs(ratio - m_resampleRatio) > 0.0001)
++      {
++        m_pAudioStream->SetResampleRatio(ratio);
++        m_resampleRatio = ratio;
++      }
++
++      const auto rateNow = std::chrono::steady_clock::now();
++      if (!m_lastRateLog || rateNow - *m_lastRateLog >= RATE_LOG_INTERVAL)
++      {
++        CLog::Log(LOGDEBUG, "RetroPlayer[AUDIO]: Buffer {:0.1f} ms, rate {:0.4f}",
++                  delaySecs * 1000, ratio);
++        m_lastRateLog = rateNow;
++      }
++
+       const unsigned int accepted =
+           m_pAudioStream->AddData(&audioPacket.data, 0, frameCount, nullptr);
+ 
+--- a/xbmc/cores/RetroPlayer/streams/RetroPlayerAudio.h	2026-09-07 18:07:02.465147395 +1200
++++ b/xbmc/cores/RetroPlayer/streams/RetroPlayerAudio.h	2026-09-07 18:07:02.478778062 +1200
+@@ -71,6 +71,10 @@
+   uint64_t m_droppedFrames = 0;
+   uint64_t m_dropEvents = 0;
+   std::optional<std::chrono::steady_clock::time_point> m_lastDropLog;
++
++  // Dynamic rate control
++  double m_resampleRatio = 1.0;
++  std::optional<std::chrono::steady_clock::time_point> m_lastRateLog;
+ };
+ } // namespace RETRO
+ } // namespace KODI
