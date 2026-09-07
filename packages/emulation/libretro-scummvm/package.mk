@@ -16,7 +16,13 @@ PKG_LIBNAME="scummvm_libretro.so"
 PKG_LIBPATH="${PKG_LIBNAME}"
 PKG_LIBVAR="SCUMMVM_LIB"
 
-PKG_MAKE_OPTS_TARGET="all"
+# FORCE_OPENGLES2: the Makefile only turns on GLES for platforms it recognises
+# by name, and CoreELEC passes platform=${TARGET_NAME} - "aarch64-libreelec-
+# linux-gnu" - which matches no branch, so the build fell back to desktop
+# OpenGL. On the Mali that produced shaders declaring "#version 110", which the
+# GLES driver rejects ("Language version '110' unknown"), and the core rendered
+# nothing at all.
+PKG_MAKE_OPTS_TARGET="all FORCE_OPENGLES2=1"
 
 pre_make_target() {
   CXXFLAGS+=" -DHAVE_POSIX_MEMALIGN=1"

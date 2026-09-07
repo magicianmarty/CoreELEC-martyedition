@@ -1,0 +1,57 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: marty <marty@fyai.co.nz>
+Date: Sun, 7 Sep 2026 22:40:00 +1200
+Subject: [PATCH] Answer the audio/video enable query
+
+RETRO_ENVIRONMENT_GET_AUDIO_VIDEO_ENABLE was declined, which is a reasonable
+default only if no client takes the answer seriously. ScummVM does:
+
+    int audio_video_enable = 0;
+    environ_cb(RETRO_ENVIRONMENT_GET_AUDIO_VIDEO_ENABLE, &audio_video_enable);
+    ...
+    if (audio_video_enable & 2)  audio_run();
+    if (audio_video_enable & 1)  video_cb(...);
+
+Declining leaves that zero, so ScummVM never submits a frame or an audio
+packet. The core loads, detects the game, sizes its framebuffer, sets up its
+mixer and runs - and produces a black screen in silence, with nothing logged
+anywhere to say why. It looked for a long time like a GLES problem, and the
+GLES build was needed too, but this is what actually kept the picture off.
+
+Kodi wants both whenever a game is playing. Run-ahead's suppressed frames are
+dropped on the Kodi side instead of here, because a client is entitled to ask
+this once and cache it.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+---
+--- a/src/libretro/LibretroEnvironment.cpp
++++ b/src/libretro/LibretroEnvironment.cpp
+@@ -694,11 +694,23 @@
+   }
+   case RETRO_ENVIRONMENT_GET_AUDIO_VIDEO_ENABLE:
+   {
+-    retro_av_enable_flags* typedData = static_cast<retro_av_enable_flags*>(data);
+-
+-    // Not implemented
+-    (void)typedData;
+-    return false;
++    int* typedData = static_cast<int*>(data);
++    if (typedData != nullptr)
++    {
++      // Answering this is not optional for every client. A core is entitled to
++      // ask whether the frontend currently wants audio and video, and ScummVM
++      // takes the question literally: it initialises the flags to zero, asks,
++      // and then submits a frame only "if (audio_video_enable & 1)" and audio
++      // only "if (& 2)". Declining left it at zero, so it produced no video and
++      // no audio at all - a black screen and silence, with no error anywhere,
++      // for a core that was otherwise running perfectly.
++      //
++      // Kodi always wants both while a game is playing. Run-ahead's suppressed
++      // frames are dropped on Kodi's side rather than here, because this answer
++      // is cached by clients that ask once.
++      *typedData = RETRO_AV_ENABLE_VIDEO | RETRO_AV_ENABLE_AUDIO;
++    }
++    break;
+   }
+   case RETRO_ENVIRONMENT_GET_MIDI_INTERFACE:
+   {
