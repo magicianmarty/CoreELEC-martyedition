@@ -1,0 +1,90 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: marty <marty@fyai.co.nz>
+Date: Mon, 8 Sep 2026 19:30:00 +1200
+Subject: [PATCH] RetroPlayer: match the display refresh to the game
+
+VideoPlayer picks a display mode per stream through ChooseBestResolution, so a
+25fps film gets a 50Hz screen. RetroPlayer never did - a game ran at whatever
+refresh the GUI happened to be on.
+
+A PAL game at 49.92fps against a 59.94Hz screen has every sixth frame shown
+twice and its audio stretched by a fifth to fit. The picture survives that; the
+sound does not, and 74 of the 349 Saturn discs here are Europe-only releases
+with no NTSC equivalent.
+
+The reported rate has to be snapped to a standard one first. Emulators report
+their true rate - a PAL Saturn is 49.920128fps - and ChooseBestResolution
+matches to a hundredth of a Hz, so the true rate matches no mode at all and the
+screen never moves. That is exactly what happened on the first attempt: the
+call was made, searched every strategy and logged "No resolution matched".
+
+Honours the same "Adjust display refresh rate" setting VideoPlayer uses, so
+turning that off keeps the old behaviour.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+---
+--- a/xbmc/cores/RetroPlayer/RetroPlayer.cpp
++++ b/xbmc/cores/RetroPlayer/RetroPlayer.cpp
+@@ -50,7 +50,12 @@
+ #include "utils/StringUtils.h"
+ #include "utils/log.h"
+ #include "windowing/WinSystem.h"
++#include "settings/Settings.h"
++#include "settings/SettingsComponent.h"
++#include "windowing/GraphicContext.h"
++#include "windowing/Resolution.h"
+ 
++#include <cmath>
+ #include <memory>
+ #include <mutex>
+ 
+@@ -204,6 +209,49 @@
+ 
+     // Set video framerate
+     m_processInfo->SetVideoFps(static_cast<float>(m_gameClient->GetFrameRate()));
++
++    // Put the screen on a refresh rate that suits the game.
++    //
++    // VideoPlayer does this per stream, so a 25fps film gets a 50Hz screen.
++    // RetroPlayer never did, and a PAL game at 49.92fps on a 59.94Hz screen has
++    // every sixth frame shown twice and its audio stretched by a fifth to fit.
++    // The picture survives that; the sound does not.
++    //
++    // Same call and same setting VideoPlayer uses, so turning off "Adjust
++    // display refresh rate" keeps the old behaviour. A game carries no
++    // dimensions of its own, so the current mode's are passed and only the
++    // refresh moves.
++    // Snap to the nearest broadcast rate before asking.
++    //
++    // Emulators report their true rate - a PAL Saturn is 49.920128fps, not 50 -
++    // and ChooseBestResolution matches to a hundredth of a Hz, so the true rate
++    // matches no mode at all and the screen never moves. The display can only
++    // produce the standard rates anyway, so ask for the one the game is
++    // obviously aiming at and leave anything unusual alone.
++    float gameFps = static_cast<float>(m_gameClient->GetFrameRate());
++    for (const float standard : {23.976f, 24.0f, 25.0f, 29.97f, 30.0f, 50.0f, 59.94f, 60.0f})
++    {
++      if (std::abs(gameFps - standard) < standard * 0.01f)
++      {
++        gameFps = standard;
++        break;
++      }
++    }
++    if (gameFps > 20.0f && gameFps < 130.0f &&
++        CServiceBroker::GetSettingsComponent()->GetSettings()->GetInt(
++            CSettings::SETTING_VIDEOPLAYER_ADJUSTREFRESHRATE) != ADJUST_REFRESHRATE_OFF)
++    {
++      CGraphicContext& gfx = CServiceBroker::GetWinSystem()->GetGfxContext();
++      const RESOLUTION_INFO& current = gfx.GetResInfo();
++      const RESOLUTION res = CResolutionUtils::ChooseBestResolution(
++          gameFps, current.iScreenWidth, current.iScreenHeight, false);
++      if (res != gfx.GetVideoResolution())
++      {
++        CLog::Log(LOGINFO, "RetroPlayer[RENDER]: Game runs at {:0.2f} fps, switching display",
++                  gameFps);
++        gfx.SetVideoResolution(res, false);
++      }
++    }
+   }
+   else
+   {
