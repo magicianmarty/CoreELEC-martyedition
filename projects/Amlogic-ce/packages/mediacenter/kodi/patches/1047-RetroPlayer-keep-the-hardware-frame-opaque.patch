@@ -1,0 +1,74 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: marty <marty@fyai.co.nz>
+Date: Tue, 9 Sep 2026 00:55:00 +1200
+Subject: [PATCH] RetroPlayer: keep the hardware frame opaque
+
+PSP games reached the panel dark and colourless - "you can see shadows and
+movement, but it's not in colour" - while a screenshot of the very same frame
+looked perfect.
+
+Both were true. The scanout buffer holds the right colour and almost no alpha.
+Sampled off the CRTC during God of War:
+
+  alpha == 0    : 81.21%
+  alpha == 255  :  1.45%
+  mean alpha    : 9.4 / 255
+  mean rgb      : 77.8 / 255
+
+The Amlogic OSD plane is ABGR8888 and composites with per-pixel alpha, so four
+fifths of the picture was composited away against black. The screenshot tool
+does BGRx -> RGB and throws the fourth byte out, which is exactly why every
+capture looked right and hid this for hours.
+
+Two sources. ClearBackBuffer() cleared alpha to 0. And blending is disabled for
+an opaque frame, so the shader wrote the texture's own alpha straight into the
+buffer - and a hardware client draws into a GL_RGBA texture without necessarily
+writing any alpha at all. Software clients never showed it: their formats carry
+no alpha, so sampling gives 1.
+
+Clear to 1.0, and mask alpha off while drawing the client's quad so what the
+clear wrote survives. Colour is untouched.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+---
+diff --git a/xbmc/cores/RetroPlayer/rendering/VideoRenderers/RPRendererFBO.cpp b/xbmc/cores/RetroPlayer/rendering/VideoRenderers/RPRendererFBO.cpp
+index 7c58840..7eb6b5c 100644
+--- a/xbmc/cores/RetroPlayer/rendering/VideoRenderers/RPRendererFBO.cpp
++++ b/xbmc/cores/RetroPlayer/rendering/VideoRenderers/RPRendererFBO.cpp
+@@ -101,7 +101,10 @@ bool CRPRendererFBO::SupportsScalingMethod(SCALINGMETHOD method)
+ 
+ void CRPRendererFBO::ClearBackBuffer()
+ {
+-  glClearColor(m_clearColour, m_clearColour, m_clearColour, 0.0f);
++  // Alpha 1.0, not 0.0. This lands in the scanout buffer, and the Amlogic OSD
++  // plane is ABGR8888 and composites with per-pixel alpha - a frame left
++  // transparent here reaches the panel as black however good its colour is.
++  glClearColor(m_clearColour, m_clearColour, m_clearColour, 1.0f);
+   glClear(GL_COLOR_BUFFER_BIT);
+   glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
+ }
+@@ -242,6 +245,15 @@ void CRPRendererFBO::Render(uint8_t alpha)
+ 
+   const uint32_t color = (alpha << 24) | 0xFFFFFF;
+ 
++  // Keep the alpha the clear wrote. Blending is off for an opaque frame, so
++  // the shader would otherwise put the texture's own alpha straight into the
++  // buffer - and a hardware client renders into a GL_RGBA texture without
++  // necessarily writing any. PPSSPP leaves 81% of the frame at alpha 0: right
++  // in colour, invisible on the panel.
++  GLboolean colourMask[4];
++  glGetBooleanv(GL_COLOR_WRITEMASK, colourMask);
++  glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_FALSE);
++
+   glBindTexture(m_textureTarget, renderBuffer->TextureID());
+ 
+   CRect viewport;
+@@ -334,6 +346,8 @@ void CRPRendererFBO::Render(uint8_t alpha)
+ 
+   m_context.DisableGUIShader();
+ 
++  glColorMask(colourMask[0], colourMask[1], colourMask[2], colourMask[3]);
++
+   glMatrixModview.PopLoad();
+   glMatrixProject.PopLoad();
+ 
