@@ -15,3 +15,20 @@ PKG_LONGDESC="game.libretro.ppsspp: PPSSPP for Kodi"
 
 PKG_IS_ADDON="yes"
 PKG_ADDON_TYPE="kodi.gameclient"
+
+addon() {
+  install_binary_addon ${PKG_ADDON_ID}
+
+  # PPSSPP's VFPU lookup tables. The wrapper add-on ships its own copy of
+  # PPSSPP's assets and that copy has no vfpu/ at all, so the core logged
+  #
+  #   [CPU] Error loading 'vfpu/vfpu_asin_lut65536.dat' (size=0, expected: 1536)
+  #
+  # once per game and fell back to computing those functions instead of looking
+  # them up. They come from the core's own source, so they always match it.
+  local vfpu="$(get_build_dir libretro-ppsspp)/assets/vfpu"
+  if [ -d "${vfpu}" ]; then
+    mkdir -p ${ADDON_BUILD}/${PKG_ADDON_ID}/resources/system/PPSSPP/vfpu
+    cp -a ${vfpu}/. ${ADDON_BUILD}/${PKG_ADDON_ID}/resources/system/PPSSPP/vfpu/
+  fi
+}
