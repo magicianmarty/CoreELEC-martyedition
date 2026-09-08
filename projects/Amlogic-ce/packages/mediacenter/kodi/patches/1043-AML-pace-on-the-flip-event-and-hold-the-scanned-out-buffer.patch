@@ -1,0 +1,236 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: marty <marty@fyai.co.nz>
+Date: Mon, 8 Sep 2026 20:50:00 +1200
+Subject: [PATCH] AML: pace on the flip event, hold the buffer being scanned out
+
+Games tear, and it tracks core speed rather than the game: the Saturn on
+yabause has the headroom to reach the next frame and tears, while the same
+game on beetle-saturn - too slow to get there - does not. The panel is not at
+fault; counted over 180s it runs 59.94028Hz against a nominal 59.94006.
+
+FlipPage committed DRM_MODE_ATOMIC_NONBLOCK without asking for the flip event,
+so nothing ever learned when a flip had happened. Two things followed. The
+render loop was never paced by vblank - the only throttle was gbm running out
+of buffers. And LockFrontBuffer held its buffer in a single unique_ptr, so
+reset() released the frame committed last time while it was still being
+scanned out; gbm handed it back to EGL as the next render target and the game
+drew into the picture on screen.
+
+Do what RetroArch's KMS context does (gfx/drivers_context/drm_ctx.c). Ask for
+DRM_MODE_PAGE_FLIP_EVENT, poll the drm fd and run drmHandleEvent to know when
+the flip landed, and keep two buffers: the one on screen and the one queued.
+The queued buffer only becomes the on-screen one - releasing its predecessor -
+once its flip is confirmed, so nothing is ever recycled while visible. Waiting
+for that event at the top of the frame is what paces the loop to the display.
+
+Deviation from RetroArch, deliberately: it waits indefinitely, this waits
+100ms. A flip that never arrives - an event swallowed across a mode switch -
+would otherwise hang the render thread for good, and on this box that means no
+GUI and no way back to one. On timeout we drop the wait but do not claim the
+flip, so no buffer is retired that might still be on screen.
+
+Blocking the commit instead was tried and is worse: it took Kodi down inside
+20 seconds of a game, twice. So was queueing buffers without fixing the
+pacing, which removes the only throttle there was and free runs the GUI.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+---
+diff --git a/xbmc/windowing/amlogic/AMLDisplay.cpp b/xbmc/windowing/amlogic/AMLDisplay.cpp
+index ade1dcb..19f004a 100644
+--- a/xbmc/windowing/amlogic/AMLDisplay.cpp
++++ b/xbmc/windowing/amlogic/AMLDisplay.cpp
+@@ -51,6 +51,12 @@ bool CAMLGBMUtils::CreateSurface(int width, int height, uint32_t format)
+ {
+   uint64_t modifier = DRM_FORMAT_MOD_LINEAR;
+ 
++  // ~CGBMSurfaceBuffer releases against the surface it was locked from, so both
++  // have to go before that surface is destroyed below.
++  m_queued.reset();
++  m_onscreen.reset();
++  m_drm_fb = nullptr;
++
+   // First try modifier-aware surface
+   m_surface.reset(gbm_surface_create_with_modifiers(GetDevice(),
+                                                     width,
+@@ -145,11 +151,19 @@ struct drm_fb* CAMLGBMUtils::GetFBFromBo(int fd, struct gbm_bo* bo)
+ bool CAMLGBMUtils::LockFrontBuffer(int fd)
+ {
+   m_drm_fb = nullptr;
+-  if (gbm_surface_has_free_buffers(GetSurface()))
+-  {
+-    m_buffer.reset(new CGBMSurfaceBuffer(GetSurface()));
+-    m_drm_fb = GetFBFromBo(fd, m_buffer->Get());
+-  }
++
++  // TrySwapBuffers' failures are ignored by the caller, and locking without a
++  // swap yields no bo - GetFBFromBo would dereference it.
++  auto buffer = std::make_unique<CGBMSurfaceBuffer>(GetSurface());
++  if (buffer->Get() == nullptr)
++    return false;
++
++  // Into the queued slot. The buffer being scanned out stays held in m_onscreen
++  // until the flip replacing it is confirmed; releasing it here would hand it
++  // back to gbm as the next render target and the game would draw into the
++  // frame on screen.
++  m_queued = std::move(buffer);
++  m_drm_fb = GetFBFromBo(fd, m_queued->Get());
+ 
+   return m_drm_fb != nullptr;
+ }
+@@ -945,8 +959,15 @@ void CAMLDRMUtils::FlipPage(uint32_t fb_id)
+     set_drmProp(m_plane->plane_id, "IN_FENCE_FD", DRM_MODE_OBJECT_PLANE , m_inFenceFd, req);
+   }
+ 
+-  if (drmModeAtomicCommit(m_fd, req, DRM_MODE_ATOMIC_NONBLOCK, NULL))
++  // Ask for the flip event and wait on it next frame. Without it nothing here
++  // ever learned when the flip happened: the commit returned immediately, the
++  // loop was paced only by gbm running out of buffers, and the buffer still
++  // being scanned out went straight back to EGL as the next render target.
++  if (drmModeAtomicCommit(m_fd, req, DRM_MODE_ATOMIC_NONBLOCK | DRM_MODE_PAGE_FLIP_EVENT,
++                          &m_waiting_for_flip))
+     CLog::Log(LOGDEBUG, "CAMLDRMUtils::{} - failed to make drmDevice atomic commit", __FUNCTION__);
++  else
++    m_waiting_for_flip = true;
+ 
+   if (m_inFenceFd != -1)
+   {
+@@ -957,6 +978,53 @@ void CAMLDRMUtils::FlipPage(uint32_t fb_id)
+   drmModeAtomicFree(req);
+ }
+ 
++namespace
++{
++void FlipHandler(int /*fd*/, unsigned int /*frame*/, unsigned int /*sec*/,
++                 unsigned int /*usec*/, void* data)
++{
++  *static_cast<bool*>(data) = false;
++}
++} // namespace
++
++bool CAMLDRMUtils::WaitFlip(bool block)
++{
++  if (!m_waiting_for_flip)
++    return false;
++
++  m_evctx.version = 2;
++  m_evctx.page_flip_handler = FlipHandler;
++  m_pollfd.fd = m_fd;
++  m_pollfd.events = POLLIN;
++
++  // Bounded, unlike RetroArch's indefinite wait. A flip that never lands - a
++  // mode switch swallowing the event, say - would otherwise hang the render
++  // thread for good, and on this box that means no GUI and no way back to one.
++  const int timeout = block ? 100 : 0;
++
++  while (m_waiting_for_flip)
++  {
++    m_pollfd.revents = 0;
++    if (poll(&m_pollfd, 1, timeout) <= 0)
++      break;
++    if (m_pollfd.revents & (POLLHUP | POLLERR))
++      break;
++    if (!(m_pollfd.revents & POLLIN))
++      break;
++    drmHandleEvent(m_fd, &m_evctx);
++  }
++
++  if (m_waiting_for_flip)
++  {
++    // Give up rather than wedge, but do not report a flip that never happened:
++    // the caller would retire a buffer that may still be on screen.
++    m_waiting_for_flip = false;
++    return false;
++  }
++
++  return true;
++}
++
+ CAMLDisplay::CAMLDisplay()
+ :  m_amlDRMUtils(new CAMLDRMUtils)
+ ,  m_stereo_mode(RenderStereoMode::UNDEFINED)
+diff --git a/xbmc/windowing/amlogic/AMLDisplay.h b/xbmc/windowing/amlogic/AMLDisplay.h
+index 165c391..bc9fc1c 100644
+--- a/xbmc/windowing/amlogic/AMLDisplay.h
++++ b/xbmc/windowing/amlogic/AMLDisplay.h
+@@ -6,6 +6,7 @@
+  */
+ 
+ #include <gbm.h>
++#include <poll.h>
+ #include <xf86drm.h>
+ #include <xf86drmMode.h>
+ #include <memory>
+@@ -31,6 +32,11 @@ public:
+   bool CreateSurface(int width, int height, uint32_t format);
+   uint32_t GetFBId() { return m_drm_fb->fb_id; }
+   bool LockFrontBuffer(int fd);
++  void RetireFlippedBuffer() { m_onscreen = std::move(m_queued); }
++  bool HasFreeBuffers() const
++  {
++    return static_cast<bool>(gbm_surface_has_free_buffers(GetSurface()));
++  }
+ private:
+   struct drm_fb* GetFBFromBo(int fd, struct gbm_bo* bo);
+ 
+@@ -72,7 +78,8 @@ private:
+   uint32_t m_format;
+   std::unique_ptr<struct gbm_device, GbmDeviceDeleter> m_device{nullptr};
+   std::unique_ptr<struct gbm_surface, GbmSurfaceDeleter> m_surface{nullptr};
+-  std::unique_ptr<CGBMSurfaceBuffer> m_buffer{nullptr};
++  std::unique_ptr<CGBMSurfaceBuffer> m_onscreen;
++  std::unique_ptr<CGBMSurfaceBuffer> m_queued;
+   struct drm_fb* m_drm_fb{nullptr};
+ };
+ 
+@@ -102,6 +109,7 @@ public:
+     const RenderStereoMode stereo_mode, bool force_mode_switch, bool active);
+   bool aml_get_drmDevice_connected() const { return m_connection == DRM_MODE_CONNECTED; }
+   void FlipPage(uint32_t fb_id);
++  bool WaitFlip(bool block);
+ 
+   void SetInFenceFd(int fd) { m_inFenceFd = fd; }
+   int TakeOutFenceFd()
+@@ -138,6 +146,10 @@ private:
+   drmModeCrtcPtr m_orig_crtc{nullptr};
+   drmModePlanePtr m_plane{nullptr};
+ 
++  bool m_waiting_for_flip{false};
++  drmEventContext m_evctx{};
++  struct pollfd m_pollfd{};
++
+   int m_inFenceFd{-1};
+   int m_outFenceFd{-1};
+ };
+@@ -174,6 +186,7 @@ public:
+   void aml_set_drmProperty(std::string name, unsigned int obj_type, std::string value)
+     { m_amlDRMUtils->aml_set_drmProperty(name, obj_type, value); }
+   void FlipPage(uint32_t fb_id) { m_amlDRMUtils->FlipPage(fb_id); }
++  bool WaitFlip(bool block) { return m_amlDRMUtils->WaitFlip(block); }
+   bool aml_set_drmDevice_active(bool active) const
+     { return m_amlDRMUtils->aml_set_drmDevice_active(
+       m_amlDRMUtils->aml_get_drmDevice_mode(),
+diff --git a/xbmc/windowing/amlogic/WinSystemAmlogicGLESContext.cpp b/xbmc/windowing/amlogic/WinSystemAmlogicGLESContext.cpp
+index 80efe9a..cdcaaad 100644
+--- a/xbmc/windowing/amlogic/WinSystemAmlogicGLESContext.cpp
++++ b/xbmc/windowing/amlogic/WinSystemAmlogicGLESContext.cpp
+@@ -299,8 +299,18 @@ void CWinSystemAmlogicGLESContext::PresentRender(bool rendered, bool videoLayer)
+     }
+ #endif
+ 
+-    if (m_amlGBMUtils && m_amlGBMUtils->LockFrontBuffer(m_amlDisplay->aml_get_Device_handle()))
+-      m_amlDisplay->FlipPage(m_amlGBMUtils->GetFBId());
++    if (m_amlGBMUtils)
++    {
++      // Block until the flip queued last frame has happened. That is the vsync:
++      // the loop now runs at the display's rate instead of as fast as gbm will
++      // hand out buffers. Only once it is confirmed is the frame it replaced off
++      // screen and safe to give back.
++      if (m_amlDisplay->WaitFlip(true))
++        m_amlGBMUtils->RetireFlippedBuffer();
++
++      if (m_amlGBMUtils->LockFrontBuffer(m_amlDisplay->aml_get_Device_handle()))
++        m_amlDisplay->FlipPage(m_amlGBMUtils->GetFBId());
++    }
+   }
+   else if (!videoLayer)
+   {

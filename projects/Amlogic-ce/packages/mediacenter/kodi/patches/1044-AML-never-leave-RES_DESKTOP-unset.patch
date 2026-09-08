@@ -1,0 +1,60 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: marty <marty@fyai.co.nz>
+Date: Mon, 8 Sep 2026 20:35:00 +1200
+Subject: [PATCH] AML: never leave RES_DESKTOP unset, it bricks the GUI
+
+RefreshResolutions only assigns RES_DESKTOP when the current display mode
+matches a probed one exactly, refresh rate included, to within FLT_EPSILON.
+A current rate the probe list cannot contain therefore leaves RES_DESKTOP
+default constructed - 1280x720 at 0.00Hz - and every CreateNewWindow then
+fails with "Unable to create window". Kodi restart loops and there is no way
+back from the GUI, because there is no GUI.
+
+This is reachable. Leaving the panel at 1080p50hz is enough: the mode survives
+a reboot but FRAC_RATE_POLICY resets to 1, the native rate is then reported as
+49.95Hz, and no such mode is ever probed because Amlogic only generates
+fractional variants for 23.976, 29.97 and 59.94. Recovering it needs modetest
+over ssh to put the connector property back.
+
+Fall back to the nearest probed mode of the same size, and say so in the log.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+---
+diff --git a/xbmc/windowing/amlogic/WinSystemAmlogic.cpp b/xbmc/windowing/amlogic/WinSystemAmlogic.cpp
+index 3cdb091..e704d3f 100644
+--- a/xbmc/windowing/amlogic/WinSystemAmlogic.cpp
++++ b/xbmc/windowing/amlogic/WinSystemAmlogic.cpp
+@@ -438,6 +438,33 @@ void CWinSystemAmlogic::RefreshResolutions()
+       CDisplaySettings::GetInstance().GetResolutionInfo(RES_DESKTOP) = res;
+     }
+   }
++
++  // The match above is exact, so a current rate the probe list cannot contain
++  // leaves RES_DESKTOP default constructed at 1280x720@0.00 and every
++  // CreateNewWindow then fails - Kodi cannot start at all, with no way back
++  // from the GUI. 1080p50hz with FRAC_RATE_POLICY still 1 reports 49.95Hz and
++  // does exactly that, because fractional variants are only generated for
++  // 23.976/29.97/59.94. Fall back to the nearest mode of the same size.
++  RESOLUTION_INFO& desktop = CDisplaySettings::GetInstance().GetResolutionInfo(RES_DESKTOP);
++  if (desktop.fRefreshRate <= 0.0f && !resolutions.empty())
++  {
++    const RESOLUTION_INFO* best = nullptr;
++    for (const auto& res : resolutions)
++    {
++      if (res.iScreenWidth != resDesktop.iScreenWidth ||
++          res.iScreenHeight != resDesktop.iScreenHeight)
++        continue;
++      if (best == nullptr || fabs(res.fRefreshRate - resDesktop.fRefreshRate) <
++                                 fabs(best->fRefreshRate - resDesktop.fRefreshRate))
++        best = &res;
++    }
++    if (best == nullptr)
++      best = &resolutions.front();
++
++    CLog::Log(LOGWARNING, "{}: no mode matches the current display rate {:f} Hz, using {}",
++              __FUNCTION__, resDesktop.fRefreshRate, best->strMode);
++    desktop = *best;
++  }
+ }
+ 
+ void CWinSystemAmlogic::UpdateResolutions()
