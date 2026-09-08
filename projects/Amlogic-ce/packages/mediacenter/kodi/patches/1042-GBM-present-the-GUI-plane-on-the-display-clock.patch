@@ -1,0 +1,45 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: marty <marty@fyai.co.nz>
+Date: Mon, 8 Sep 2026 20:15:00 +1200
+Subject: [PATCH] GBM: present the GUI plane on the display clock
+
+Games tear; the GUI and video do not.
+
+The GBM backend takes the DRM_MODE_ATOMIC_NONBLOCK path whenever it is not
+drawing to the video plane, so a commit returns before the flip and the next
+frame can land part way down the screen. Video never showed it because video
+goes out on the video plane, where async is already false. Games render to the
+GUI plane.
+
+It only became visible once a game had the headroom to outrun the panel: the
+Saturn on yabause renders 60.5fps against 59.94Hz and tears, while the same
+game on beetle-saturn - too slow to reach 60 - does not, because being late is
+its own throttle. Kodi's own vsync setting cannot help, SetVSyncImpl on this
+backend is an empty stub.
+
+A blocking commit waits for the flip, which is what vsync means here. The GUI
+is drawn well inside a frame either way, so it gives up nothing for it.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+---
+--- a/xbmc/windowing/gbm/WinSystemGbmGLESContext.cpp
++++ b/xbmc/windowing/gbm/WinSystemGbmGLESContext.cpp
+@@ -144,7 +144,17 @@
+ 
+   if (rendered || videoLayer)
+   {
+-    bool async = !videoLayer && m_eglFence;
++    // Present the GUI plane on the display's clock, not as fast as it can.
++    //
++    // async takes the DRM_MODE_ATOMIC_NONBLOCK path, so the commit returns
++    // before the flip and the next frame can land mid-scanout. Video never
++    // noticed, because it goes out on the video plane where async is already
++    // false; games render to the GUI plane and do notice. A Saturn core with
++    // headroom ran at 60.5fps against a 59.94Hz panel and tore, while the same
++    // game on a core too slow to reach 60 did not - being late is its own
++    // throttle. A blocking commit waits for the flip, which is what vsync means
++    // here, and the GUI is drawn well inside a frame either way.
++    bool async = false;
+     if (rendered)
+     {
+ #if defined(EGL_ANDROID_native_fence_sync) && defined(EGL_KHR_fence_sync)
