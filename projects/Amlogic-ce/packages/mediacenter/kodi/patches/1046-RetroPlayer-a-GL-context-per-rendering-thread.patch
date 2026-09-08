@@ -1,0 +1,159 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: marty <marty@fyai.co.nz>
+Date: Mon, 8 Sep 2026 23:25:00 +1200
+Subject: [PATCH] RetroPlayer: a GL context per rendering thread
+
+PSP games rendered magnified and cropped, past Kodi's scaling, and looked
+correct the moment the OSD made Kodi composite the frame itself.
+
+The pool makes its context current when it creates it and only releases it at
+teardown, so it stays owned by that thread for the session. That is fine while
+the client renders on the same thread - Mupen64Plus-Next does - and wrong for
+one that does not. PPSSPP takes SET_HW_RENDER on one thread and renders on
+another:
+
+  T:907   Enabling hardware rendering for OpenGLES 2.0
+  T:1254  Framebuffer incomplete, status 0x0   (x70)
+          Failed to make context current on the game loop
+
+eglMakeCurrent then fails, because a context cannot be current on two threads
+at once and only the owner may release one - the owner here being inside the
+client. The render thread was left with no context at all, so every GL call
+failed, the framebuffer was never complete, GetCurrentFramebuffer() answered 0,
+and 0 tells libretro to draw to the default framebuffer. PPSSPP rendered
+straight to the screen with the geometry of its own 480x270 display, which is
+exactly the picture that came out.
+
+So give each rendering thread a context of its own, sharing with the pool's.
+The texture and renderbuffers are shared and visible to it, and patch 1045
+already hands out a framebuffer name per context, which is what containers not
+being shared requires. Threads that already have a context keep it, so the
+Mupen64Plus path is untouched.
+
+RetroArch has none of this: it refuses to run a hardware-rendered core on a
+separate video thread - "the threaded driver does not support SET_HW_RENDER" -
+so there is one context, on the thread that calls retro_run. Kodi's game loop
+and renderer are separate threads by construction, so the contexts have to be.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+---
+diff --git a/xbmc/cores/RetroPlayer/buffers/RenderBufferPoolFBO.cpp b/xbmc/cores/RetroPlayer/buffers/RenderBufferPoolFBO.cpp
+index dc1e5a6..60b8484 100644
+--- a/xbmc/cores/RetroPlayer/buffers/RenderBufferPoolFBO.cpp
++++ b/xbmc/cores/RetroPlayer/buffers/RenderBufferPoolFBO.cpp
+@@ -94,14 +94,70 @@ void CRenderBufferPoolFBO::MakeContextCurrent()
+   if (current != EGL_NO_CONTEXT)
+     return;
+ 
+-  if (!eglMakeCurrent(m_eglDisplay, EGL_NO_SURFACE, EGL_NO_SURFACE, m_eglContext))
++  if (eglMakeCurrent(m_eglDisplay, EGL_NO_SURFACE, EGL_NO_SURFACE, m_eglContext))
++    return;
++
++  // The pool's context is current on the thread that created it, and EGL will
++  // not move one: only the owning thread can release it, and here that thread
++  // is sitting inside the client. PPSSPP takes SET_HW_RENDER on one thread and
++  // renders on another, so this is its normal case rather than a fault, and it
++  // used to leave the caller with no context at all - every GL call failing,
++  // the framebuffer never complete, GetCurrentFramebuffer() answering 0, and
++  // the client drawing to the screen past our renderer.
++  //
++  // Give this thread its own context in the same share group. The texture and
++  // renderbuffers are shared and so visible to it; CRenderBufferFBO hands out
++  // a framebuffer name per context, which is what containers not being shared
++  // requires.
++  //
++  // RetroArch sidesteps all of this by refusing to run a hardware-rendered
++  // core on a separate video thread - "the threaded driver does not support
++  // SET_HW_RENDER" - leaving one context on the thread that calls retro_run.
++  // That is not a choice available here.
++  const std::thread::id thisThread = std::this_thread::get_id();
++
++  std::unique_lock<std::mutex> lock(m_threadContextMutex);
++
++  auto it = m_threadContexts.find(thisThread);
++  if (it == m_threadContexts.end())
++  {
++    // clang-format off
++#if defined(HAS_GLES)
++    const EGLint context_attribs[] = {
++      EGL_CONTEXT_CLIENT_VERSION, 2,
++      EGL_NONE
++    };
++#else
++    const EGLint context_attribs[] = {
++      EGL_CONTEXT_MAJOR_VERSION_KHR, 3,
++      EGL_CONTEXT_MINOR_VERSION_KHR, 2,
++      EGL_CONTEXT_OPENGL_PROFILE_MASK_KHR, EGL_CONTEXT_OPENGL_CORE_PROFILE_BIT_KHR,
++      EGL_NONE
++    };
++#endif
++    // clang-format on
++
++    const EGLContext threadContext =
++        eglCreateContext(m_eglDisplay, m_eglConfig, m_eglContext, context_attribs);
++    if (threadContext == EGL_NO_CONTEXT)
++    {
++      CLog::Log(LOGERROR,
++                "RetroPlayer[RENDER]: Failed to create a shared context for the render thread");
++      return;
++    }
++
++    CLog::Log(LOGDEBUG, "RetroPlayer[RENDER]: Shared GL context created for the client's thread");
++    it = m_threadContexts.emplace(thisThread, threadContext).first;
++  }
++
++  if (!eglMakeCurrent(m_eglDisplay, EGL_NO_SURFACE, EGL_NO_SURFACE, it->second))
+   {
+     // Once: this sits on the per-frame path.
+     static bool logged = false;
+     if (!logged)
+     {
+       logged = true;
+-      CLog::Log(LOGERROR, "RetroPlayer[RENDER]: Failed to make context current on the game loop");
++      CLog::Log(LOGERROR, "RetroPlayer[RENDER]: Failed to make the shared context current");
+     }
+   }
+ }
+@@ -258,6 +314,14 @@ void CRenderBufferPoolFBO::DestroyContext()
+   }
+ 
+   eglMakeCurrent(m_eglDisplay, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
++
++  {
++    std::unique_lock<std::mutex> lock(m_threadContextMutex);
++    for (const auto& threadContext : m_threadContexts)
++      eglDestroyContext(m_eglDisplay, threadContext.second);
++    m_threadContexts.clear();
++  }
++
+   eglDestroyContext(m_eglDisplay, m_eglContext);
+   m_eglContext = EGL_NO_CONTEXT;
+ }
+diff --git a/xbmc/cores/RetroPlayer/buffers/RenderBufferPoolFBO.h b/xbmc/cores/RetroPlayer/buffers/RenderBufferPoolFBO.h
+index 3427545..f495967 100644
+--- a/xbmc/cores/RetroPlayer/buffers/RenderBufferPoolFBO.h
++++ b/xbmc/cores/RetroPlayer/buffers/RenderBufferPoolFBO.h
+@@ -10,6 +10,10 @@
+ 
+ #include "cores/RetroPlayer/buffers/BaseRenderBufferPool.h"
+ 
++#include <map>
++#include <mutex>
++#include <thread>
++
+ #include <EGL/egl.h>
+ #include <EGL/eglext.h>
+ 
+@@ -61,6 +65,12 @@ protected:
+   EGLConfig m_eglConfig{nullptr};
+   EGLContext m_eglContext{EGL_NO_CONTEXT};
+ 
++  // One context per thread that renders, each sharing with m_eglContext. EGL
++  // will not move a context between threads, so a client with a render thread
++  // of its own needs one there.
++  std::map<std::thread::id, EGLContext> m_threadContexts;
++  std::mutex m_threadContextMutex;
++
+ private:
+   bool CreateFramebuffer();
+ 
