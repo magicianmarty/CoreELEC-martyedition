@@ -18,6 +18,12 @@ PKG_LIBVAR="YABASANSHIRO_LIB"
 # The branch's own target for "Amlogic G12A or Allwinner H616": 64-bit, GLES,
 # and the AArch64 dynarec. Its AMLG12B target names this exact SoC but builds
 # 32-bit userspace, which this image is not. It also sets HAVE_SSE=0 itself.
+# The dynarec stays on. It looked guilty - the core ran for a few seconds and
+# then hard-reset the whole box, which is what a recompiler emitting bad code
+# does - but the cause was game.libretro reopening the stream on every
+# SET_GEOMETRY, which tore down Kodi's render buffer pool at frame rate. With
+# that fixed the dynarec runs indefinitely; building without it only made the
+# box survive long enough to hide the real fault.
 PKG_MAKE_OPTS_TARGET="-C yabause/src/libretro platform=arm64_cortex_a53_gles3"
 
 if [ "${OPENGL_SUPPORT}" = "yes" ]; then
