@@ -1,0 +1,101 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: marty <marty@fyai.co.nz>
+Date: Tue, 9 Sep 2026 20:05:00 +1200
+Subject: [PATCH] RetroPlayer: do not reread the savestate to keep its label
+
+Every commit to a slot that already existed loaded the file it was about to
+replace, through CSavestateDatabase::GetSavestate() - which reads the whole
+file into memory and deserialises it - and used exactly one field of it:
+
+  savestate->SetLabel(loadedSavestate ? loadedSavestate->Label() : "");
+
+God of War serialises 128 MB, so each autosave after the first paid a 128 MB
+read on top of its 128 MB write. CE_STORAGE sustains about 45 MB/s here, so
+that is roughly six seconds per save rather than three, and
+CReversiblePlayback::Deinitialize() waits on every queued save before the
+game client is unloaded:
+
+  // Wait for autosave tasks
+  for (std::future<void>& task : m_savestateThreads)
+    task.wait();
+
+which is why leaving a PSP game froze the GUI for about nine seconds.
+
+Remember the label against the path it belongs to instead. Keying the cache on
+the path makes it self-invalidating: a new autosave slot has a different path,
+so it misses and reads once - or, for a slot created this session, finds no
+file and skips the read entirely.
+
+Manual saves are unaffected; they still read the slot they overwrite.
+
+The trade-off: relabelling an autosave from the savestate manager while the
+game is still running no longer survives the next autosave to that slot. It
+used to, because every commit reread the file. Renaming an autosave mid-game
+is rare, and six seconds of disk on every save is not.
+---
+diff --git a/xbmc/cores/RetroPlayer/playback/ReversiblePlayback.h b/xbmc/cores/RetroPlayer/playback/ReversiblePlayback.h
+--- a/xbmc/cores/RetroPlayer/playback/ReversiblePlayback.h
++++ b/xbmc/cores/RetroPlayer/playback/ReversiblePlayback.h
+@@ -103,6 +103,12 @@
+   // Savestate functionality
+   std::unique_ptr<CSavestateDatabase> m_savestateDatabase;
+   std::string m_autosavePath{};
++
++  // The label belonging to m_autosaveLabelPath, so committing to that slot does
++  // not have to read the file back for it. Keyed on the path so that moving to a
++  // new slot invalidates it without every assignment having to remember to.
++  std::string m_autosaveLabelPath{};
++  std::string m_autosaveLabel{};
+   std::vector<std::future<void>> m_savestateThreads;
+   CCriticalSection m_savestateMutex;
+ 
+diff --git a/xbmc/cores/RetroPlayer/playback/ReversiblePlayback.cpp b/xbmc/cores/RetroPlayer/playback/ReversiblePlayback.cpp
+--- a/xbmc/cores/RetroPlayer/playback/ReversiblePlayback.cpp
++++ b/xbmc/cores/RetroPlayer/playback/ReversiblePlayback.cpp
+@@ -243,7 +243,6 @@
+                                           uint64_t timestampFrames)
+ {
+   std::unique_ptr<ISavestate> savestate = CSavestateDatabase::AllocateSavestate();
+-  std::unique_ptr<ISavestate> loadedSavestate;
+ 
+   const size_t memorySize = m_gameClient->SerializeSize();
+   uint8_t* const memoryData = savestate->GetMemoryBuffer(memorySize);
+@@ -284,13 +283,25 @@
+   }
+ 
+   // Attempt to get existing properties
++  std::string label;
+   {
+     std::unique_lock lock(m_savestateMutex);
+-    if (!savePath.empty() && XFILE::CFile::Exists(savePath))
++
++    if (autosave && !savePath.empty() && savePath == m_autosaveLabelPath)
++    {
++      label = m_autosaveLabel;
++    }
++    else if (!savePath.empty() && XFILE::CFile::Exists(savePath))
++    {
++      std::unique_ptr<ISavestate> loadedSavestate = CSavestateDatabase::AllocateSavestate();
++      if (m_savestateDatabase->GetSavestate(savePath, *loadedSavestate))
++        label = loadedSavestate->Label();
++    }
++
++    if (autosave)
+     {
+-      loadedSavestate = CSavestateDatabase::AllocateSavestate();
+-      if (!m_savestateDatabase->GetSavestate(savePath, *loadedSavestate))
+-        loadedSavestate.reset();
++      m_autosaveLabelPath = savePath;
++      m_autosaveLabel = label;
+     }
+   }
+ 
+@@ -304,7 +315,7 @@
+   const std::string gameClientVersion = m_gameClient->Version().asString();
+ 
+   savestate->SetType(autosave ? SAVE_TYPE::AUTO : SAVE_TYPE::MANUAL);
+-  savestate->SetLabel(loadedSavestate ? loadedSavestate->Label() : "");
++  savestate->SetLabel(label);
+   savestate->SetCaption(caption);
+   savestate->SetCreated(nowUTC);
+   savestate->SetGameFileName(gameFileName);

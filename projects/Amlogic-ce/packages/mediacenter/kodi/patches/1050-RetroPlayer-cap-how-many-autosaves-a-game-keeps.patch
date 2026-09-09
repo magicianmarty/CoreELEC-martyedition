@@ -1,0 +1,171 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: marty <marty@fyai.co.nz>
+Date: Tue, 9 Sep 2026 20:40:00 +1200
+Subject: [PATCH] RetroPlayer: cap how many autosaves a game keeps
+
+Every playback opens a new autosave slot - CreateSavestate() mints a fresh
+timestamped path whenever m_autosavePath is empty - and nothing anywhere
+removes the old ones. There is no pruning, no cap and no rotation in either
+savestates/ or playback/.
+
+God of War serialises 128 MB, so twenty sessions had left 2.6 GB of autosaves
+behind, out of 3.6 GB of savestates on a 24.8 GB partition. It only grows.
+
+Keep the newest three per game and delete the rest as each autosave commits.
+
+Pruning has to know which savestates are autosaves, and the type is a field
+inside the file: classifying by reading them would mean loading every
+savestate of the game, 128 MB apiece, on every autosave - the exact cost
+1049 just removed. So autosaves are named with an "auto_" prefix and picked
+out of a directory listing instead. Nothing parses these filenames (the GUI
+takes its date from the savestate's own created field, and listings glob on
+the extension), and manual saves keep the old naming, so they are never
+matched and never pruned.
+
+Savestates written before this keep their old names and are not pruned
+either, which is deliberate: their type cannot be told from the name.
+---
+diff --git a/xbmc/cores/RetroPlayer/savestates/SavestateDatabase.h b/xbmc/cores/RetroPlayer/savestates/SavestateDatabase.h
+--- a/xbmc/cores/RetroPlayer/savestates/SavestateDatabase.h
++++ b/xbmc/cores/RetroPlayer/savestates/SavestateDatabase.h
+@@ -51,6 +51,20 @@
+   bool ClearSavestatesOfGame(const std::string& gamePath, const std::string& gameClient = "");
+ 
+   static std::string MakeSavestatePath(const std::string& gamePath, const CDateTime& creationTime);
++
++  /*!
++   * \brief Path for an autosave, named so it can be told from a manual save
++   *        without opening it
++   */
++  static std::string MakeAutosavePath(const std::string& gamePath,
++                                      const CDateTime& creationTime);
++
++  /*!
++   * \brief Delete all but the newest \p keep autosaves of a game
++   *
++   * Manual saves are never considered.
++   */
++  void PruneAutosaves(const std::string& gamePath, unsigned int keep);
+   static std::string MakeThumbnailPath(const std::string& savestatePath);
+ 
+ private:
+diff --git a/xbmc/cores/RetroPlayer/savestates/SavestateDatabase.cpp b/xbmc/cores/RetroPlayer/savestates/SavestateDatabase.cpp
+--- a/xbmc/cores/RetroPlayer/savestates/SavestateDatabase.cpp
++++ b/xbmc/cores/RetroPlayer/savestates/SavestateDatabase.cpp
+@@ -20,15 +20,23 @@
+ #include "games/dialogs/DialogGameDefines.h"
+ #include "resources/LocalizeStrings.h"
+ #include "resources/ResourcesComponent.h"
++#include "utils/StringUtils.h"
+ #include "utils/URIUtils.h"
+ #include "utils/log.h"
+ 
++#include <algorithm>
+ #include <cstring>
++#include <functional>
+ #include <memory>
++#include <vector>
+ 
+ namespace
+ {
+ constexpr auto SAVESTATE_EXTENSION = ".sav";
++// Autosaves carry this so pruning can pick them out of a directory listing.
++// Reading each file to check its type instead would mean loading every
++// savestate of the game - 128 MB apiece for a PSP title.
++constexpr auto AUTOSAVE_PREFIX = "auto_";
+ constexpr auto SAVESTATE_BASE_FOLDER = "special://home/saves/";
+ } // namespace
+ 
+@@ -261,6 +269,53 @@
+   return URIUtils::AddFileToFolder(path, creationTime.GetAsSaveString() + SAVESTATE_EXTENSION);
+ }
+ 
++std::string CSavestateDatabase::MakeAutosavePath(const std::string& gamePath,
++                                                 const CDateTime& creationTime)
++{
++  std::string path = MakePath(gamePath);
++  if (path.empty())
++    return "";
++
++  return URIUtils::AddFileToFolder(path, AUTOSAVE_PREFIX + creationTime.GetAsSaveString() +
++                                             SAVESTATE_EXTENSION);
++}
++
++void CSavestateDatabase::PruneAutosaves(const std::string& gamePath, unsigned int keep)
++{
++  const std::string savesFolder = MakePath(gamePath);
++  if (savesFolder.empty())
++    return;
++
++  CFileItemList items;
++  XFILE::CDirectory::CHints hints;
++  hints.mask = SAVESTATE_EXTENSION;
++
++  if (!XFILE::CDirectory::GetDirectory(savesFolder, items, hints))
++    return;
++
++  // Only the ones this named as autosaves. Anything else is either a manual
++  // save or predates the prefix, and is left alone.
++  std::vector<std::string> autosaves;
++  for (int i = 0; i < items.Size(); ++i)
++  {
++    const std::string path = items[i]->GetPath();
++    if (StringUtils::StartsWith(URIUtils::GetFileName(path), AUTOSAVE_PREFIX))
++      autosaves.emplace_back(path);
++  }
++
++  if (autosaves.size() <= keep)
++    return;
++
++  // The name carries the creation time, so sorting it sorts by age
++  std::sort(autosaves.begin(), autosaves.end(), std::greater<std::string>());
++
++  for (size_t i = keep; i < autosaves.size(); ++i)
++  {
++    CLog::Log(LOGDEBUG, "Pruning autosave {}", CURL::GetRedacted(autosaves[i]));
++    DeleteSavestate(autosaves[i]);
++  }
++}
++
+ std::string CSavestateDatabase::MakeThumbnailPath(const std::string& savestatePath)
+ {
+   return URIUtils::ReplaceExtension(savestatePath, ".jpg");
+diff --git a/xbmc/cores/RetroPlayer/playback/ReversiblePlayback.cpp b/xbmc/cores/RetroPlayer/playback/ReversiblePlayback.cpp
+--- a/xbmc/cores/RetroPlayer/playback/ReversiblePlayback.cpp
++++ b/xbmc/cores/RetroPlayer/playback/ReversiblePlayback.cpp
+@@ -53,6 +53,11 @@
+ {
+ constexpr int MAX_RUNAHEAD_FRAMES = 4;
+ 
++// How many autosaves of a game to keep. Each playback opens a new slot, and
++// nothing upstream ever removed the old ones: God of War serialises 128 MB,
++// so twenty sessions had left 2.6 GB behind on a 24.8 GB partition.
++constexpr unsigned int AUTOSAVE_HISTORY = 3;
++
+ unsigned int GetRunAheadFrames()
+ {
+   int frames =
+@@ -205,7 +210,9 @@
+ 
+     // If path is still unknown, calculate it now
+     if (savePath.empty())
+-      savePath = CSavestateDatabase::MakeSavestatePath(m_gameClient->GetGamePath(), nowUTC);
++      savePath = autosave
++                     ? CSavestateDatabase::MakeAutosavePath(m_gameClient->GetGamePath(), nowUTC)
++                     : CSavestateDatabase::MakeSavestatePath(m_gameClient->GetGamePath(), nowUTC);
+ 
+     // Update autosave path
+     if (autosave)
+@@ -338,6 +345,12 @@
+   {
+     std::string thumbnailPath = CSavestateDatabase::MakeThumbnailPath(savePath);
+     m_renderManager.SaveThumbnail(thumbnailPath);
++
++    if (autosave)
++    {
++      std::unique_lock lock(m_savestateMutex);
++      m_savestateDatabase->PruneAutosaves(m_gameClient->GetGamePath(), AUTOSAVE_HISTORY);
++    }
+   }
+ 
+   // Notify the GUI that the metadata for this savestate should be refreshed
