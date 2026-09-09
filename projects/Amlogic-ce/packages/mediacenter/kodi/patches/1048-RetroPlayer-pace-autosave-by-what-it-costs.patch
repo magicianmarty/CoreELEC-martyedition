@@ -1,0 +1,110 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: marty <marty@fyai.co.nz>
+Date: Tue, 9 Sep 2026 16:45:00 +1200
+Subject: [PATCH] RetroPlayer: pace autosave by the size of the state
+
+God of War stuttered - picture and sound together, a few times a minute:
+
+  16:28:18  Wrote savestate of 134217984 bytes
+  16:28:28  Wrote savestate of 134217984 bytes
+  16:28:38  Wrote savestate of 134217984 bytes
+
+128MB every ten seconds, ~13MB/s sustained, and the emulator stalls for each
+one. Ten seconds is upstream's figure and it suits what it was written for: a
+PS1 autosave here is 4.7MB and has never been noticeable. PPSSPP's are
+twenty-eight times that.
+
+Pacing on how long CreateAutosave() takes does not work - measured, and it
+changed nothing. It returns once the write is queued and a job thread does the
+writing, so the call looks cheap however big the state is:
+
+  T:65191  RetroPlayer[SAVE]: Saved state to ...
+  T:65514  Wrote savestate of 134217984 bytes      (0.6s later, another thread)
+
+The size is what costs, so pace on that: stat the state and hold the write rate
+to 2MB/s. A 4.7MB state stays on its ten seconds because it is already inside
+that budget; a 128MB one moves to about a minute. No per-core table, and it
+follows a core whose state size changes.
+
+Autosave stays on - it was asked for, and turning it off for one system is a
+worse answer than making it affordable.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+---
+diff --git a/xbmc/cores/RetroPlayer/RetroPlayerAutoSave.cpp b/xbmc/cores/RetroPlayer/RetroPlayerAutoSave.cpp
+index 86b8d98..79d92f5 100644
+--- a/xbmc/cores/RetroPlayer/RetroPlayerAutoSave.cpp
++++ b/xbmc/cores/RetroPlayer/RetroPlayerAutoSave.cpp
+@@ -8,8 +8,11 @@
+ 
+ #include "RetroPlayerAutoSave.h"
+ 
++#include <algorithm>
++
+ #include "URL.h"
+ #include "games/GameSettings.h"
++#include "filesystem/File.h"
+ #include "utils/log.h"
+ 
+ using namespace KODI;
+@@ -19,6 +22,19 @@ using namespace std::chrono_literals;
+ namespace
+ {
+ constexpr auto AUTOSAVE_DURATION_SECS = 10s; // Auto-save every 10 seconds
++
++// How fast we are willing to write autosaves, in bytes per second.
++//
++// Ten seconds suits the states this was written for: a PS1 autosave here is
++// 4.7MB, which is well under this and keeps the ten seconds it has always had.
++// A PPSSPP state is 134,217,984 bytes - 128MB every ten seconds, ~13MB/s
++// sustained, and the emulator stalls for each one: picture and sound together,
++// six times a minute.
++//
++// Pacing on how long CreateAutosave() takes does not work, because it returns
++// once the write is queued and a job thread does the writing. The size is what
++// costs, so pace on that.
++constexpr uint64_t AUTOSAVE_BYTES_PER_SECOND = 2 * 1024 * 1024;
+ }
+ 
+ CRetroPlayerAutoSave::CRetroPlayerAutoSave(IAutoSaveCallback& callback,
+@@ -43,9 +59,12 @@ void CRetroPlayerAutoSave::Process()
+ {
+   CLog::Log(LOGDEBUG, "RetroPlayer[SAVE]: Autosave thread started");
+ 
++  auto interval =
++      std::chrono::duration_cast<std::chrono::milliseconds>(AUTOSAVE_DURATION_SECS);
++
+   while (!m_bStop)
+   {
+-    CThread::Sleep(AUTOSAVE_DURATION_SECS);
++    CThread::Sleep(interval);
+ 
+     if (m_bStop)
+       break;
+@@ -57,7 +76,26 @@ void CRetroPlayerAutoSave::Process()
+     {
+       std::string savePath = m_callback.CreateAutosave();
+       if (!savePath.empty())
++      {
+         CLog::Log(LOGDEBUG, "RetroPlayer[SAVE]: Saved state to {}", CURL::GetRedacted(savePath));
++
++        struct __stat64 statBuffer = {};
++        if (XFILE::CFile::Stat(savePath, &statBuffer) == 0 && statBuffer.st_size > 0)
++        {
++          const auto size = static_cast<uint64_t>(statBuffer.st_size);
++          const auto paced = std::chrono::seconds(size / AUTOSAVE_BYTES_PER_SECOND);
++          const auto next = std::max(
++              std::chrono::duration_cast<std::chrono::milliseconds>(AUTOSAVE_DURATION_SECS),
++              std::chrono::duration_cast<std::chrono::milliseconds>(paced));
++
++          if (next != interval)
++          {
++            CLog::Log(LOGDEBUG, "RetroPlayer[SAVE]: State is {} bytes, autosaving every {}s",
++                      size, next.count() / 1000);
++            interval = next;
++          }
++        }
++      }
+     }
+   }
+ 
