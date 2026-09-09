@@ -1,0 +1,57 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: marty <marty@fyai.co.nz>
+Date: Tue, 9 Sep 2026 19:30:00 +1200
+Subject: [PATCH] Only reopen the stream when the geometry changes
+
+SET_GEOMETRY is defined as a cheap, cosmetic update, so cores are free to
+send it every frame and some do: yabasanshiro re-announces 704x448 on each
+retro_run. Closing the stream unconditionally turned that into a reopen per
+frame, and every reopen sets CRPRenderManager's flush flag, so the render
+thread destroyed and rebuilt the whole buffer pool at frame rate.
+
+Panzer Dragoon II ran ~6000 of those cycles in 107 seconds before the render
+thread destroyed a buffer the game loop was still holding and Kodi took a
+SIGBUS in CBaseRenderBufferPool::Flush(), branching to 0x61.
+
+Comparing first costs nothing and leaves a genuine resolution change - which
+is what the reopen is for - working as before.
+---
+diff --git a/src/video/VideoGeometry.h b/src/video/VideoGeometry.h
+--- a/src/video/VideoGeometry.h
++++ b/src/video/VideoGeometry.h
+@@ -20,6 +20,15 @@ namespace LIBRETRO
+     CVideoGeometry(CVideoGeometry&) = default;
+     CVideoGeometry(const retro_game_geometry &geometry);
+ 
++    bool operator==(const CVideoGeometry &rhs) const
++    {
++      return m_nominalWidth == rhs.m_nominalWidth &&
++             m_nominalHeight == rhs.m_nominalHeight &&
++             m_maxWidth == rhs.m_maxWidth &&
++             m_maxHeight == rhs.m_maxHeight &&
++             m_displayAspectRatio == rhs.m_displayAspectRatio;
++    }
++
+     void UpdateVideoGeometry(const retro_game_geometry &geometry);
+ 
+     unsigned int NominalWidth() const { return m_nominalWidth; }
+diff --git a/src/video/VideoStream.cpp b/src/video/VideoStream.cpp
+--- a/src/video/VideoStream.cpp
++++ b/src/video/VideoStream.cpp
+@@ -36,8 +36,15 @@ void CVideoStream::Deinitialize()
+ 
+ void CVideoStream::SetGeometry(const CVideoGeometry &geometry)
+ {
++  // SET_GEOMETRY is cheap by contract, so cores send it whenever they feel
++  // like it - yabasanshiro sends the same 704x448 every frame. Reopening the
++  // stream for that flushes Kodi's render buffer pool at frame rate, and the
++  // render thread eventually frees a buffer the game loop still holds.
++  if (*m_geometry == geometry)
++    return;
++
+   // Close stream so it can be reopened with the updated geometry
+   if (m_addon != nullptr)
+     CloseStream();
+ 
+   *m_geometry = geometry;
+ }
