@@ -1,0 +1,45 @@
+Kodi 22 has no "hidden" setting type, so the three settings declared with it
+are never created:
+
+  error <CSettingGroup>: unknown setting type "hidden" of "launchscript_conf"
+  error <CSettingGroup>: unable to create new setting "launchscript_conf"
+
+launchscript_conf is how Luna remembers which launch script to run, so
+ConfigHelper reads back an empty string, launchscripts_path stays None, and
+picking a game does nothing at all - the app list appears, the selection is
+accepted, and no stream ever starts. It also re-asks which launch script to
+use on every entry, because the answer can never be stored.
+
+A string setting marked not visible is the supported way to keep a value out
+of the settings UI.
+---
+diff --git a/resources/settings.xml b/resources/settings.xml
+--- a/resources/settings.xml
++++ b/resources/settings.xml
+@@ -242,14 +242,23 @@
+                         <close>true</close>
+                     </control>
+                 </setting>
+-                <setting id="addon_version" type="hidden" help="">
++                <setting id="addon_version" type="string" help="">
+                     <level>0</level>
++                    <visible>false</visible>
++                    <default></default>
++                    <control type="edit" format="string"/>
+                 </setting>
+-                <setting id="last_run" type="hidden" label="30045" help="">
++                <setting id="last_run" type="string" label="30045" help="">
+                     <level>0</level>
++                    <visible>false</visible>
++                    <default></default>
++                    <control type="edit" format="string"/>
+                 </setting>
+-                <setting id="launchscript_conf" type="hidden" label="30045" help="">
++                <setting id="launchscript_conf" type="string" label="30045" help="">
+                     <level>0</level>
++                    <visible>false</visible>
++                    <default></default>
++                    <control type="edit" format="string"/>
+                 </setting>
+             </group>
+         </category>

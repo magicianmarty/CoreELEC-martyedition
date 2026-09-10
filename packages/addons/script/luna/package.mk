@@ -30,4 +30,10 @@ addon() {
   mkdir -p ${ADDON_BUILD}/${PKG_ADDON_ID}/lib
     cp $(get_install_dir moonlight-embedded)/usr/lib/* ${ADDON_BUILD}/${PKG_ADDON_ID}/lib
 
+  # Luna only chmod +x's these when you pick a launch script through its dialog,
+  # so a configuration restored from a settings file gets scripts it cannot
+  # execute - Popen raises, and it reports "moonlight-embedded might have
+  # crashed" with nothing in the log.
+  chmod +x ${ADDON_BUILD}/${PKG_ADDON_ID}/resources/launchscripts/*/*.sh
+  chmod +x ${ADDON_BUILD}/${PKG_ADDON_ID}/resources/create_bug_report.sh
 }

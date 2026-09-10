@@ -1,0 +1,24 @@
+The video backends are built as separate shared objects from one source file
+each (add_library(moonlight-aml SHARED ./src/video/aml.c)), but they call
+helpers that live in the executable - aml.c uses ensure_buf_size() from
+src/util.c. Nothing exports those, so .dynsym holds none of them and loading
+the backend dies at the first call:
+
+  ./moonlight: symbol lookup error: libmoonlight-aml.so:
+      undefined symbol: ensure_buf_size
+
+ENABLE_EXPORTS puts the executable's symbols in its dynamic table, which is
+what a plugin dlopen'd against its host needs. Affects every backend built
+this way, not just aml.
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -84,6 +84,7 @@
+ add_subdirectory(libgamestream)
+ 
+ add_executable(moonlight ${SRC_LIST})
++set_target_properties(moonlight PROPERTIES ENABLE_EXPORTS ON)
+ target_link_libraries(moonlight m)
+ target_link_libraries(moonlight gamestream)
+ 

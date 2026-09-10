@@ -13,9 +13,12 @@ PKG_DEPENDS_TARGET="toolchain curl pulseaudio systemd alsa-lib moonlight-common-
 PKG_SECTION=""
 PKG_SHORTDESC="Open source NVIDIA GameStream Linux client"
 PKG_LONGDESC="Moonlight Embedded is an open source implementation of NVIDIA's GameStream, as used by the NVIDIA Shield, but built for Linux."
-PKG_CMAKE_OPTS_TARGET="-DENABLE_FFMPEG=OFF -DENABLE_CEC=OFF -DENABLE_SDL=OFF -DCURL_LIBRARIES=curl"
-
-PKG_CMAKE_OPTS_TARGET="-DCMAKE_POLICY_VERSION_MINIMUM=3.5"
+# One assignment: this was set twice, and the second silently discarded the
+# first, so FFMPEG/CEC/SDL were built in and libcec failed to init on every
+# start.
+PKG_CMAKE_OPTS_TARGET="-DENABLE_FFMPEG=OFF -DENABLE_CEC=OFF -DENABLE_SDL=OFF \
+                       -DCURL_LIBRARIES=curl \
+                       -DCMAKE_POLICY_VERSION_MINIMUM=3.5"
 
 pre_build_target() {
   cp -a $(get_build_dir moonlight-common-c)/* ${PKG_BUILD}/third_party/moonlight-common-c
